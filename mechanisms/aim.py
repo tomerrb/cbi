@@ -1,10 +1,19 @@
-"""Implementation of AIM: An Adaptive and Iterative Mechanism for DP Synthetic Data.
+"""Implementation of CLAIM: Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data.
 
-Note that with the default settings, AIM can take many hours to run.  You can configure
-the runtime /utility tradeoff via the max_model_size flag.  We recommend setting it to 1.0
-for debugging, but keeping the default value of 80 for any official comparisons to this mechanism.
+This implementation supports two selection modes:
+- "marginal" (default): Original L1-based selection using the exponential mechanism.
+  Selects the worst-approximated marginal based on L1 distance.
+- "ate": ATE-based selection for causal inference applications.
+  Selects the marginal that most improves Average Treatment Effect estimation.
+  Requires DoWhy library and causal structure specification.
 
-Note that we assume in this file that the data has been appropriately preprocessed so that there are no large-cardinality categorical attributes.  If there are, we recommend using something like "compress_domain" from mst.py.  Since our paper evaluated already-preprocessed datastes, we did not implement that here for simplicity.
+Note that with the default settings, CLAIM can take many hours to run. You can configure
+the runtime/utility tradeoff via the max_model_size flag. We recommend setting it to 1.0
+for debugging, but keeping the default value of 80 for any official comparisons.
+
+Note that we assume the data has been appropriately preprocessed so that there are no
+large-cardinality categorical attributes. If there are, we recommend using something like
+"compress_domain" from mst.py.
 """
 
 import numpy as np
@@ -65,7 +74,26 @@ def filter_candidates(candidates, model, size_limit):
     return ans
 
 
-class AIM(Mechanism):
+class CLAIM(Mechanism):
+    """Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data.
+    
+    Args:
+        epsilon: Privacy parameter (epsilon for zCDP conversion).
+        delta: Privacy parameter.
+        prng: Optional random number generator.
+        rounds: Number of selection rounds (default: 16 * domain size).
+        max_model_size: Maximum model size in MB (default: 80).
+        max_iters: Maximum iterations for mirror descent (default: 1000).
+        structural_zeros: Dict of structural zeros constraints.
+        selection_mode: "marginal" (L1-based) or "ate" (ATE-based) selection.
+        treatment: Treatment variable name (required for ATE mode).
+        outcome: Outcome variable name (required for ATE mode).
+        confounders: List of confounder variable names (required for ATE mode).
+        causal_graph_path: Path to GML file with causal graph (required for ATE mode).
+        ate_sample_size: Samples for final ATE computation (default: 10000).
+        sim_sample_size: Samples for simulation during selection (default: 5000).
+    """
+    
     def __init__(
         self,
         epsilon,
@@ -75,14 +103,218 @@ class AIM(Mechanism):
         max_model_size=80,
         max_iters=1000,
         structural_zeros={},
+        selection_mode="marginal",
+        treatment=None,
+        outcome=None,
+        confounders=None,
+        causal_graph_path=None,
+        ate_sample_size=10000,
+        sim_sample_size=5000,
     ):
-        super(AIM, self).__init__(epsilon, delta, prng)
+        super(CLAIM, self).__init__(epsilon, delta, prng)
         self.rounds = rounds
         self.max_iters = max_iters
         self.max_model_size = max_model_size
         self.structural_zeros = structural_zeros
+        
+        # Selection mode configuration
+        self.selection_mode = selection_mode
+        if selection_mode not in ("marginal", "ate"):
+            raise ValueError(f"selection_mode must be 'marginal' or 'ate', got '{selection_mode}'")
+        
+        # ATE mode configuration
+        self.treatment = treatment
+        self.outcome = outcome
+        self.confounders = confounders
+        self.ate_sample_size = ate_sample_size
+        self.sim_sample_size = sim_sample_size
+        self.causal_graph = None
+        self._true_ate = None
+        
+        if selection_mode == "ate":
+            # Validate required causal parameters
+            if not all([treatment, outcome, confounders, causal_graph_path]):
+                raise ValueError(
+                    "ATE mode requires treatment, outcome, confounders, and causal_graph_path"
+                )
+            # Load GML causal graph
+            with open(causal_graph_path, 'r') as f:
+                self.causal_graph = f.read()
+
+    def compute_ate_from_data(self, df):
+        """Compute ATE using DoWhy's backdoor adjustment.
+        
+        Args:
+            df: DataFrame containing treatment, outcome, and confounder columns.
+            
+        Returns:
+            float: Estimated ATE value.
+        """
+        # Late import to avoid dependency when not using ATE mode
+        from dowhy import CausalModel
+        
+        model = CausalModel(
+            data=df,
+            treatment=self.treatment,
+            outcome=self.outcome,
+            graph=self.causal_graph
+        )
+        
+        identified_estimand = model.identify_effect(proceed_when_unidentifiable=True)
+        estimate = model.estimate_effect(
+            identified_estimand,
+            method_name="backdoor.linear_regression"
+        )
+        
+        return estimate.value
+
+    def _model_to_dataframe(self, model, num_samples, seed=None):
+        """Generate synthetic DataFrame from PGM model with optional seed for reproducibility.
+        
+        Args:
+            model: Fitted PGM model.
+            num_samples: Number of samples to generate.
+            seed: Optional random seed for reproducibility.
+            
+        Returns:
+            DataFrame: Synthetic data.
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        synth = model.synthetic_data(rows=num_samples)
+        return synth.df
+
+    def _simulate_measurement(self, model, data, clique, measurements):
+        """Simulate measuring a clique without actually adding noise.
+        
+        Returns a new model fitted with the additional measurement.
+        Used to predict how measuring a particular clique would affect ATE.
+        
+        Args:
+            model: Current fitted PGM model.
+            data: Original Dataset.
+            clique: Clique to simulate measuring.
+            measurements: Current list of measurements.
+            
+        Returns:
+            Model: New model fitted with the simulated measurement.
+        """
+        # Get true marginal (no noise since we're simulating)
+        x = data.project(clique).datavector()
+        
+        # Small stddev = high confidence measurement
+        temp_measurement = LinearMeasurement(x, clique, stddev=1e-10)
+        
+        # Copy and extend measurements
+        sim_measurements = measurements.copy()
+        sim_measurements.append(temp_measurement)
+        
+        # Warm start from current model
+        pcliques = list(set(M.clique for M in sim_measurements))
+        potentials = model.potentials.expand(pcliques)
+        
+        # Fit with fewer iterations for speed during simulation
+        sim_model = estimation.mirror_descent(
+            data.domain, 
+            sim_measurements, 
+            iters=min(self.max_iters, 500),
+            potentials=potentials,
+            callback_fn=lambda *_: None
+        )
+        
+        return sim_model
+
+    def _fallback_worst_approximated(self, candidates, answers, model, sigma):
+        """Original L1-based selection as fallback (deterministic, no exponential mechanism).
+        
+        Args:
+            candidates: Dict of candidate cliques with weights.
+            answers: Dict of true marginals.
+            model: Current fitted model.
+            sigma: Noise standard deviation.
+            
+        Returns:
+            tuple: Selected clique.
+        """
+        errors = {}
+        for cl in candidates:
+            wgt = candidates[cl]
+            x = answers[cl]
+            xest = model.project(cl).datavector()
+            errors[cl] = wgt * np.linalg.norm(x - xest, 1)
+        
+        # Deterministic: pick max error
+        return max(errors, key=errors.get)
+
+    def worst_ate_approximated(self, candidates, answers, data, model, measurements, sigma):
+        """Select the marginal that most improves ATE estimation.
+        
+        Iterates over candidates, simulates measuring each one, and selects
+        the one that minimizes ATE error. Falls back to L1 selection if no
+        candidate improves ATE.
+        
+        Args:
+            candidates: Dict of candidate cliques with weights.
+            answers: Dict of true marginals.
+            data: Original Dataset.
+            model: Current fitted model.
+            measurements: Current list of measurements.
+            sigma: Noise standard deviation.
+            
+        Returns:
+            tuple: Selected clique.
+        """
+        # Use cached true ATE
+        true_ate = self._true_ate
+        
+        # Current model's ATE (use fixed seed for consistency)
+        current_model_df = self._model_to_dataframe(model, self.sim_sample_size, seed=42)
+        current_ate = self.compute_ate_from_data(current_model_df)
+        current_error = abs(true_ate - current_ate)
+        
+        print(f"Current ATE error: {current_error:.6f} (true={true_ate:.4f}, model={current_ate:.4f})")
+        
+        best_candidate = None
+        best_error = current_error
+        
+        for cl in candidates:
+            try:
+                # Simulate measuring this clique
+                simulated_model = self._simulate_measurement(model, data, cl, measurements)
+                
+                # Compute ATE with fixed seed
+                simulated_df = self._model_to_dataframe(simulated_model, self.sim_sample_size, seed=42)
+                simulated_ate = self.compute_ate_from_data(simulated_df)
+                simulated_error = abs(true_ate - simulated_ate)
+                
+                if simulated_error < best_error:
+                    best_error = simulated_error
+                    best_candidate = cl
+                    print(f"  Candidate {cl}: error={simulated_error:.6f} (BETTER)")
+            except Exception as e:
+                print(f"  Candidate {cl}: failed ({e})")
+                continue
+        
+        # Fallback: use original L1-based selection if no ATE improvement
+        if best_candidate is None:
+            print("No ATE improvement found, falling back to L1 selection")
+            best_candidate = self._fallback_worst_approximated(candidates, answers, model, sigma)
+        
+        return best_candidate
 
     def worst_approximated(self, candidates, answers, model, eps, sigma):
+        """Original L1-based selection using the exponential mechanism.
+        
+        Args:
+            candidates: Dict of candidate cliques with weights.
+            answers: Dict of true marginals.
+            model: Current fitted model.
+            eps: Epsilon for exponential mechanism.
+            sigma: Noise standard deviation.
+            
+        Returns:
+            tuple: Selected clique.
+        """
         errors = {}
         sensitivity = {}
         for cl in candidates:
@@ -99,6 +331,11 @@ class AIM(Mechanism):
         return self.exponential_mechanism(errors, eps, max_sensitivity)
 
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
+        # Cache true ATE at the start if using ATE mode
+        if self.selection_mode == "ate":
+            self._true_ate = self.compute_ate_from_data(data.df)
+            print(f"True ATE from data: {self._true_ate:.6f}")
+        
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
         answers = {cl: data.project(cl).datavector() for cl in candidates}
@@ -143,9 +380,16 @@ class AIM(Mechanism):
             size_limit = self.max_model_size * rho_used / self.rho
 
             small_candidates = filter_candidates(candidates, model, size_limit)
-            cl = self.worst_approximated(
-                small_candidates, answers, model, epsilon, sigma
-            )
+            
+            # Branch on selection mode
+            if self.selection_mode == "ate":
+                cl = self.worst_ate_approximated(
+                    small_candidates, answers, data, model, measurements, sigma
+                )
+            else:
+                cl = self.worst_approximated(
+                    small_candidates, answers, model, epsilon, sigma
+                )
             print('Measuring Clique', cl)
             n = data.domain.size(cl)
             x = data.project(cl).datavector()
@@ -193,13 +437,20 @@ def default_params():
     params["degree"] = 2
     params["num_marginals"] = None
     params["max_cells"] = 10000
+    # Selection mode: "marginal" (L1-based) or "ate" (ATE-based)
+    params["selection_mode"] = "marginal"
+    # Causal parameters (required when selection_mode="ate")
+    params["treatment"] = None
+    params["outcome"] = None
+    params["confounders"] = None
+    params["causal_graph"] = None
 
     return params
 
 
 if __name__ == "__main__":
 
-    description = ""
+    description = "CLAIM: Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data"
     formatter = argparse.ArgumentDefaultsHelpFormatter
     parser = argparse.ArgumentParser(description=description, formatter_class=formatter)
     parser.add_argument("--dataset", help="dataset to use")
@@ -220,9 +471,44 @@ if __name__ == "__main__":
         help="maximum number of cells for marginals in workload",
     )
     parser.add_argument("--save", type=str, help="path to save synthetic data")
+    
+    # Selection mode arguments
+    parser.add_argument(
+        "--selection_mode",
+        type=str,
+        choices=["marginal", "ate"],
+        help="Selection mode: 'marginal' (L1-based) or 'ate' (ATE-based)"
+    )
+    
+    # Causal structure arguments (required when selection_mode="ate")
+    parser.add_argument(
+        "--treatment",
+        type=str,
+        help="Treatment variable name (required for ATE mode)"
+    )
+    parser.add_argument(
+        "--outcome",
+        type=str,
+        help="Outcome variable name (required for ATE mode)"
+    )
+    parser.add_argument(
+        "--confounders",
+        type=str,
+        help="Comma-separated list of confounder variable names (required for ATE mode)"
+    )
+    parser.add_argument(
+        "--causal_graph",
+        type=str,
+        help="Path to GML file with causal graph (required for ATE mode)"
+    )
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
+    
+    # Parse confounders from comma-separated string if provided
+    confounders_list = None
+    if args.confounders is not None:
+        confounders_list = [c.strip() for c in args.confounders.split(',')]
 
     data = Dataset.load(args.dataset, args.domain)
 
@@ -236,17 +522,31 @@ if __name__ == "__main__":
         ]
 
     workload = [(cl, 1.0) for cl in workload]
-    mech = AIM(
+    mech = CLAIM(
         args.epsilon,
         args.delta,
         max_model_size=args.max_model_size,
         max_iters=args.max_iters,
+        selection_mode=args.selection_mode,
+        treatment=args.treatment,
+        outcome=args.outcome,
+        confounders=confounders_list,
+        causal_graph_path=args.causal_graph,
     )
     model, synth = mech.run(data, workload)
 
     if args.save is not None:
         synth.df.to_csv(args.save, index=False)
 
+    # Print ATE comparison if in ATE mode
+    if args.selection_mode == "ate":
+        true_ate = mech._true_ate
+        synth_ate = mech.compute_ate_from_data(synth.df)
+        print(f"True ATE: {true_ate:.6f}")
+        print(f"Synthetic ATE: {synth_ate:.6f}")
+        print(f"ATE Error: {abs(true_ate - synth_ate):.6f}")
+
+    # Print marginal errors
     synth_errors = []
     model_errors = []
     for proj, wgt in workload:
@@ -257,4 +557,5 @@ if __name__ == "__main__":
         synth_errors.append(e)
         e = 0.5 * wgt * np.linalg.norm(X / X.sum() - Z / Z.sum(), 1)
         model_errors.append(e)
-    print("Average Error: ", np.mean(model_errors), np.mean(synth_errors))
+    print("Average Marginal Error: ", np.mean(model_errors), np.mean(synth_errors))
+
