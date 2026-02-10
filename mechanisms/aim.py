@@ -88,12 +88,18 @@ class CLAIM(Mechanism):
         max_iters: Maximum iterations for mirror descent (default: 1000).
         structural_zeros: Dict of structural zeros constraints.
         selection_mode: "marginal" (L1-based) or "ate" (ATE-based) selection.
-        treatment: Treatment variable name (required for ATE mode).
-        outcome: Outcome variable name (required for ATE mode).
-        confounders: List of confounder variable names (required for ATE mode).
+        ate_configs: List of ATE configurations (required for ATE mode). Each config is a dict:
+            - "name": str, identifier for this ATE
+            - "treatment": str, treatment variable name
+            - "outcome": str, outcome variable name  
+            - "confounders": list[str], confounder variable names
+            - "alpha": float, weight in [0, 1] for this ATE in utility function
         causal_graph_path: Path to GML file with causal graph (required for ATE mode).
         ate_sample_size: Samples for final ATE computation (default: 10000).
         sim_sample_size: Samples for simulation during selection (default: 5000).
+        marginal_weight: Weight for L1 marginal error in hybrid selection (default: 0.3).
+            0.0 = pure ATE selection, 1.0 = pure marginal selection.
+            Only used when selection_mode="ate".
     """
     
     def __init__(
@@ -106,12 +112,11 @@ class CLAIM(Mechanism):
         max_iters=1000,
         structural_zeros={},
         selection_mode="marginal",
-        treatment=None,
-        outcome=None,
-        confounders=None,
+        ate_configs=None,
         causal_graph_path=None,
         ate_sample_size=10000,
         sim_sample_size=5000,
+        marginal_weight=0.3,
     ):
         super(CLAIM, self).__init__(epsilon, delta, prng)
         self.rounds = rounds
@@ -125,29 +130,132 @@ class CLAIM(Mechanism):
             raise ValueError(f"selection_mode must be 'marginal' or 'ate', got '{selection_mode}'")
         
         # ATE mode configuration
-        self.treatment = treatment
-        self.outcome = outcome
-        self.confounders = confounders
+        self.ate_configs = ate_configs or []
         self.ate_sample_size = ate_sample_size
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
-        self._true_ate = None
+        self._true_ates = {}  # Dict of {name: true_ate_value}
+        
+        # Hybrid selection configuration
+        self.marginal_weight = marginal_weight
+        if not (0.0 <= marginal_weight <= 1.0):
+            raise ValueError(f"marginal_weight must be in [0, 1], got {marginal_weight}")
         
         if selection_mode == "ate":
             # Validate required causal parameters
-            if not all([treatment, outcome, confounders, causal_graph_path]):
+            if not ate_configs or not causal_graph_path:
                 raise ValueError(
-                    "ATE mode requires treatment, outcome, confounders, and causal_graph_path"
+                    "ATE mode requires ate_configs (list of ATE configurations) and causal_graph_path"
                 )
-            # Load GML causal graph
+            
+            # Validate each ATE config
+            for i, config in enumerate(ate_configs):
+                required_keys = ["name", "treatment", "outcome", "confounders", "alpha"]
+                for key in required_keys:
+                    if key not in config:
+                        raise ValueError(f"ATE config {i} missing required key: '{key}'")
+                if not (0 <= config["alpha"] <= 1):
+                    raise ValueError(f"ATE config '{config['name']}' alpha must be in [0, 1], got {config['alpha']}")
+            
+            # Validate alpha weights sum to 1
+            alpha_sum = sum(config["alpha"] for config in ate_configs)
+            if abs(alpha_sum - 1.0) > 1e-6:
+                raise ValueError(
+                    f"ATE alpha weights must sum to 1.0, got {alpha_sum:.6f}. "
+                    f"Weights: {[config['alpha'] for config in ate_configs]}"
+                )
+            
+            # Load GML causal graph (shared across all ATEs)
             with open(causal_graph_path, 'r') as f:
                 self.causal_graph = f.read()
 
-    def compute_ate_from_data(self, df):
-        """Compute ATE using DoWhy's backdoor adjustment.
+    def _binarize_for_ate(self, df, config):
+        """Apply binarization to treatment and outcome columns for ATE calculation.
+        
+        This converts encoded (integer) data to binary (0/1) based on the config.
+        Called just before ATE calculation to prepare the data for DoWhy.
         
         Args:
-            df: DataFrame containing treatment, outcome, and confounder columns.
+            df: DataFrame with encoded data.
+            config: ATE config dict with optional 'binarization' field:
+                {
+                    "treatment": "educational-num",
+                    "outcome": "income",
+                    "binarization": {
+                        "treatment": {"type": "threshold", "threshold": 9, "comparison": ">"},
+                        "outcome": {"type": "threshold", "threshold": 0, "comparison": ">"}
+                    }
+                }
+                If binarization not specified, assumes data is already binary.
+        
+        Returns:
+            DataFrame: Copy with binarized treatment and outcome.
+        """
+        df = df.copy()
+        treatment = config["treatment"]
+        outcome = config["outcome"]
+        binarization = config.get("binarization", {})
+        
+        # Binarize treatment if config provided
+        if "treatment" in binarization:
+            bin_config = binarization["treatment"]
+            if bin_config.get("type") == "threshold":
+                threshold = bin_config.get("threshold", 0)
+                comparison = bin_config.get("comparison", ">")
+                if comparison == ">":
+                    df[treatment] = (df[treatment] > threshold).astype(int)
+                elif comparison == ">=":
+                    df[treatment] = (df[treatment] >= threshold).astype(int)
+                elif comparison == "<":
+                    df[treatment] = (df[treatment] < threshold).astype(int)
+                elif comparison == "<=":
+                    df[treatment] = (df[treatment] <= threshold).astype(int)
+            elif bin_config.get("type") == "value":
+                # For categorical: specific value = 1, others = 0
+                # In encoded data, this is a specific integer
+                positive_value = bin_config.get("positive_value", 1)
+                df[treatment] = (df[treatment] == positive_value).astype(int)
+            elif bin_config.get("type") == "categorical":
+                # For categorical type: use encoded_positive_value for encoded data
+                encoded_positive_value = bin_config.get("encoded_positive_value")
+                if encoded_positive_value is not None:
+                    df[treatment] = (df[treatment] == encoded_positive_value).astype(int)
+                else:
+                    # Fallback to positive_value if encoded_positive_value not specified
+                    positive_value = bin_config.get("positive_value", 1)
+                    df[treatment] = (df[treatment] == positive_value).astype(int)
+        
+        # Binarize outcome if config provided
+        if "outcome" in binarization:
+            bin_config = binarization["outcome"]
+            if bin_config.get("type") == "threshold":
+                threshold = bin_config.get("threshold", 0)
+                comparison = bin_config.get("comparison", ">")
+                if comparison == ">":
+                    df[outcome] = (df[outcome] > threshold).astype(int)
+                elif comparison == ">=":
+                    df[outcome] = (df[outcome] >= threshold).astype(int)
+            elif bin_config.get("type") == "value":
+                positive_value = bin_config.get("positive_value", 1)
+                df[outcome] = (df[outcome] == positive_value).astype(int)
+            elif bin_config.get("type") == "categorical":
+                # For categorical type: use encoded_positive_value for encoded data
+                encoded_positive_value = bin_config.get("encoded_positive_value")
+                if encoded_positive_value is not None:
+                    df[outcome] = (df[outcome] == encoded_positive_value).astype(int)
+                else:
+                    # Fallback to positive_value if encoded_positive_value not specified
+                    positive_value = bin_config.get("positive_value", 1)
+                    df[outcome] = (df[outcome] == positive_value).astype(int)
+        
+        return df
+
+    def compute_ate_from_data(self, df, config):
+        """Compute ATE for a single treatment-outcome pair using DoWhy's backdoor adjustment.
+        
+        Args:
+            df: DataFrame containing treatment, outcome, and confounder columns (encoded).
+            config: ATE config dict with treatment, outcome, and optional binarization.
             
         Returns:
             float: Estimated ATE value.
@@ -155,10 +263,16 @@ class CLAIM(Mechanism):
         # Late import to avoid dependency when not using ATE mode
         from dowhy import CausalModel
         
+        treatment = config["treatment"]
+        outcome = config["outcome"]
+        
+        # Apply binarization for ATE calculation
+        df_binary = self._binarize_for_ate(df, config)
+        
         model = CausalModel(
-            data=df,
-            treatment=self.treatment,
-            outcome=self.outcome,
+            data=df_binary,
+            treatment=treatment,
+            outcome=outcome,
             graph=self.causal_graph
         )
         
@@ -169,6 +283,39 @@ class CLAIM(Mechanism):
         )
         
         return estimate.value
+
+    def compute_all_ates(self, df):
+        """Compute all configured ATEs from a DataFrame.
+        
+        Args:
+            df: DataFrame containing all required columns (encoded).
+            
+        Returns:
+            dict: {ate_name: ate_value} for each configured ATE.
+        """
+        ates = {}
+        for config in self.ate_configs:
+            ate_value = self.compute_ate_from_data(df, config)
+            ates[config["name"]] = ate_value
+        return ates
+
+    def compute_weighted_ate_error(self, true_ates, model_ates):
+        """Compute weighted sum of ATE errors: Σ α_i * |true_i - model_i|.
+        
+        Args:
+            true_ates: Dict of {name: true_ate_value}.
+            model_ates: Dict of {name: model_ate_value}.
+            
+        Returns:
+            float: Weighted ATE error.
+        """
+        weighted_error = 0.0
+        for config in self.ate_configs:
+            name = config["name"]
+            alpha = config["alpha"]
+            error = abs(true_ates[name] - model_ates[name])
+            weighted_error += alpha * error
+        return weighted_error
 
     def _model_to_dataframe(self, model, num_samples, seed=None):
         """Generate synthetic DataFrame from PGM model with optional seed for reproducibility.
@@ -248,12 +395,53 @@ class CLAIM(Mechanism):
         # Deterministic: pick max error
         return max(errors, key=errors.get)
 
-    def worst_ate_approximated(self, candidates, answers, data, model, measurements, sigma):
-        """Select the marginal that most improves ATE estimation.
+    def _compute_l1_scores(self, candidates, answers, model):
+        """Compute L1 error scores for all candidates.
         
-        Iterates over candidates, simulates measuring each one, and selects
-        the one that minimizes ATE error. Falls back to L1 selection if no
-        candidate improves ATE.
+        Args:
+            candidates: Dict of candidate cliques with weights.
+            answers: Dict of true marginals.
+            model: Current fitted model.
+            
+        Returns:
+            dict: {clique: L1_error_score}
+        """
+        scores = {}
+        for cl in candidates:
+            wgt = candidates[cl]
+            x = answers[cl]
+            xest = model.project(cl).datavector()
+            scores[cl] = wgt * np.linalg.norm(x - xest, 1)
+        return scores
+
+    def _normalize_scores(self, scores):
+        """Normalize scores to [0, 1] range using min-max normalization.
+        
+        Args:
+            scores: Dict of {clique: score}.
+            
+        Returns:
+            dict: {clique: normalized_score} in [0, 1] range.
+        """
+        if not scores:
+            return {}
+        
+        values = list(scores.values())
+        min_val = min(values)
+        max_val = max(values)
+        
+        # Avoid division by zero if all scores are equal
+        if max_val - min_val < 1e-10:
+            return {cl: 0.5 for cl in scores}
+        
+        return {cl: (s - min_val) / (max_val - min_val) for cl, s in scores.items()}
+
+    def worst_ate_approximated(self, candidates, answers, data, model, measurements, sigma):
+        """Select marginal using hybrid strategy combining ATE and L1 scores.
+        
+        Uses marginal_weight to balance between:
+        - L1 error scores (how poorly each marginal is approximated)
+        - ATE improvement scores (how much each marginal improves ATE estimation)
         
         Args:
             candidates: Dict of candidate cliques with weights.
@@ -266,18 +454,29 @@ class CLAIM(Mechanism):
         Returns:
             tuple: Selected clique.
         """
-        # Use cached true ATE
-        true_ate = self._true_ate
+        # Use cached true ATEs
+        true_ates = self._true_ates
         
-        # Current model's ATE (use fixed seed for consistency)
+        # Step 1: Compute L1 scores (fast, no simulation)
+        l1_scores = self._compute_l1_scores(candidates, answers, model)
+        
+        # Step 2: Compute ATE improvement scores (requires simulation)
+        ate_scores = {}
+        
+        # Current model's ATEs (use fixed seed for consistency)
         current_model_df = self._model_to_dataframe(model, self.sim_sample_size, seed=42)
-        current_ate = self.compute_ate_from_data(current_model_df)
-        current_error = abs(true_ate - current_ate)
+        current_ates = self.compute_all_ates(current_model_df)
+        current_error = self.compute_weighted_ate_error(true_ates, current_ates)
         
-        print(f"Current ATE error: {current_error:.6f} (true={true_ate:.4f}, model={current_ate:.4f})")
-        
-        best_candidate = None
-        best_error = current_error
+        # Print current status for each ATE
+        print(f"Current weighted ATE error: {current_error:.6f}")
+        print(f"Hybrid selection: marginal_weight={self.marginal_weight:.2f}")
+        for config in self.ate_configs:
+            name = config["name"]
+            alpha = config["alpha"]
+            true_val = true_ates[name]
+            model_val = current_ates[name]
+            print(f"  {name} (α={alpha}): true={true_val:.4f}, model={model_val:.4f}, error={abs(true_val - model_val):.4f}")
         
         for cl in candidates:
             simulated_model = None
@@ -286,18 +485,19 @@ class CLAIM(Mechanism):
                 # Simulate measuring this clique
                 simulated_model = self._simulate_measurement(model, data, cl, measurements)
                 
-                # Compute ATE with fixed seed
+                # Compute all ATEs with fixed seed
                 simulated_df = self._model_to_dataframe(simulated_model, self.sim_sample_size, seed=42)
-                simulated_ate = self.compute_ate_from_data(simulated_df)
-                simulated_error = abs(true_ate - simulated_ate)
+                simulated_ates = self.compute_all_ates(simulated_df)
+                simulated_error = self.compute_weighted_ate_error(true_ates, simulated_ates)
                 
-                if simulated_error < best_error:
-                    best_error = simulated_error
-                    best_candidate = cl
-                    print(f"  Candidate {cl}: error={simulated_error:.6f} (BETTER)")
+                # ATE improvement score (higher = better improvement)
+                # We use current_error - simulated_error so positive means improvement
+                ate_scores[cl] = current_error - simulated_error
+                
             except Exception as e:
                 print(f"  Candidate {cl}: failed ({e})")
-                continue
+                # Assign zero improvement score if simulation fails
+                ate_scores[cl] = 0.0
             finally:
                 # Force cleanup after each candidate to prevent memory accumulation
                 if simulated_model is not None:
@@ -308,12 +508,31 @@ class CLAIM(Mechanism):
                 # Clear JAX JIT compilation caches to prevent LLVM memory buildup
                 jax.clear_caches()
         
-        # Fallback: use original L1-based selection if no ATE improvement
-        if best_candidate is None:
-            print("No ATE improvement found, falling back to L1 selection")
-            best_candidate = self._fallback_worst_approximated(candidates, answers, model, sigma)
+        # Step 3: Normalize both score sets to [0, 1]
+        l1_normalized = self._normalize_scores(l1_scores)
+        ate_normalized = self._normalize_scores(ate_scores)
+        
+        # Step 4: Combine with marginal_weight
+        # combined = λ * L1 + (1-λ) * ATE
+        combined_scores = {}
+        for cl in candidates:
+            l1_score = l1_normalized.get(cl, 0.0)
+            ate_score = ate_normalized.get(cl, 0.0)
+            combined_scores[cl] = (
+                self.marginal_weight * l1_score + 
+                (1 - self.marginal_weight) * ate_score
+            )
+        
+        # Step 5: Select best candidate (highest combined score)
+        best_candidate = max(combined_scores, key=combined_scores.get)
+        best_combined = combined_scores[best_candidate]
+        best_l1 = l1_normalized.get(best_candidate, 0.0)
+        best_ate = ate_normalized.get(best_candidate, 0.0)
+        
+        print(f"Selected {best_candidate}: L1={best_l1:.3f}, ATE={best_ate:.3f}, combined={best_combined:.3f}")
         
         return best_candidate
+
 
     def worst_approximated(self, candidates, answers, model, eps, sigma):
         """Original L1-based selection using the exponential mechanism.
@@ -344,10 +563,14 @@ class CLAIM(Mechanism):
         return self.exponential_mechanism(errors, eps, max_sensitivity)
 
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
-        # Cache true ATE at the start if using ATE mode
+        # Cache true ATEs at the start if using ATE mode
         if self.selection_mode == "ate":
-            self._true_ate = self.compute_ate_from_data(data.df)
-            print(f"True ATE from data: {self._true_ate:.6f}")
+            self._true_ates = self.compute_all_ates(data.df)
+            print("True ATEs from data:")
+            for config in self.ate_configs:
+                name = config["name"]
+                alpha = config["alpha"]
+                print(f"  {name} (α={alpha}): {self._true_ates[name]:.6f}")
         
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
@@ -453,15 +676,16 @@ def default_params():
     # Selection mode: "marginal" (L1-based) or "ate" (ATE-based)
     params["selection_mode"] = "marginal"
     # Causal parameters (required when selection_mode="ate")
-    params["treatment"] = None
-    params["outcome"] = None
-    params["confounders"] = None
+    params["ate_configs"] = None  # Path to JSON file with ATE configs
     params["causal_graph"] = None
+    # Hybrid selection weight: 0.0 = pure ATE, 1.0 = pure marginal
+    params["marginal_weight"] = 0.3
 
     return params
 
 
 if __name__ == "__main__":
+    import json
 
     description = "CLAIM: Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data"
     formatter = argparse.ArgumentDefaultsHelpFormatter
@@ -493,35 +717,33 @@ if __name__ == "__main__":
         help="Selection mode: 'marginal' (L1-based) or 'ate' (ATE-based)"
     )
     
-    # Causal structure arguments (required when selection_mode="ate")
+    # Multi-ATE configuration (required when selection_mode="ate")
     parser.add_argument(
-        "--treatment",
+        "--ate_configs",
         type=str,
-        help="Treatment variable name (required for ATE mode)"
-    )
-    parser.add_argument(
-        "--outcome",
-        type=str,
-        help="Outcome variable name (required for ATE mode)"
-    )
-    parser.add_argument(
-        "--confounders",
-        type=str,
-        help="Comma-separated list of confounder variable names (required for ATE mode)"
+        help="Path to JSON file with ATE configurations. Each config should have: "
+             "name, treatment, outcome, confounders (list), alpha (weight in [0,1])"
     )
     parser.add_argument(
         "--causal_graph",
         type=str,
         help="Path to GML file with causal graph (required for ATE mode)"
     )
+    parser.add_argument(
+        "--marginal_weight",
+        type=float,
+        help="Weight for L1 marginal error in hybrid selection (0.0 = pure ATE, 1.0 = pure marginal)."
+             " Only used when selection_mode='ate'. Default: 0.3"
+    )
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
     
-    # Parse confounders from comma-separated string if provided
-    confounders_list = None
-    if args.confounders is not None:
-        confounders_list = [c.strip() for c in args.confounders.split(',')]
+    # Load ATE configs from JSON file if provided
+    ate_configs_list = None
+    if args.ate_configs is not None:
+        with open(args.ate_configs, 'r') as f:
+            ate_configs_list = json.load(f)
 
     data = Dataset.load(args.dataset, args.domain)
 
@@ -541,10 +763,9 @@ if __name__ == "__main__":
         max_model_size=args.max_model_size,
         max_iters=args.max_iters,
         selection_mode=args.selection_mode,
-        treatment=args.treatment,
-        outcome=args.outcome,
-        confounders=confounders_list,
+        ate_configs=ate_configs_list,
         causal_graph_path=args.causal_graph,
+        marginal_weight=args.marginal_weight,
     )
     model, synth = mech.run(data, workload)
 
@@ -553,11 +774,20 @@ if __name__ == "__main__":
 
     # Print ATE comparison if in ATE mode
     if args.selection_mode == "ate":
-        true_ate = mech._true_ate
-        synth_ate = mech.compute_ate_from_data(synth.df)
-        print(f"True ATE: {true_ate:.6f}")
-        print(f"Synthetic ATE: {synth_ate:.6f}")
-        print(f"ATE Error: {abs(true_ate - synth_ate):.6f}")
+        true_ates = mech._true_ates
+        synth_ates = mech.compute_all_ates(synth.df)
+        print("\nATE Comparison:")
+        total_weighted_error = 0.0
+        for config in mech.ate_configs:
+            name = config["name"]
+            alpha = config["alpha"]
+            true_val = true_ates[name]
+            synth_val = synth_ates[name]
+            error = abs(true_val - synth_val)
+            weighted_error = alpha * error
+            total_weighted_error += weighted_error
+            print(f"  {name} (α={alpha}): true={true_val:.6f}, synth={synth_val:.6f}, error={error:.6f}")
+        print(f"  Weighted Total Error: {total_weighted_error:.6f}")
 
     # Print marginal errors
     synth_errors = []
@@ -571,4 +801,5 @@ if __name__ == "__main__":
         e = 0.5 * wgt * np.linalg.norm(X / X.sum() - Z / Z.sum(), 1)
         model_errors.append(e)
     print("Average Marginal Error: ", np.mean(model_errors), np.mean(synth_errors))
+
 

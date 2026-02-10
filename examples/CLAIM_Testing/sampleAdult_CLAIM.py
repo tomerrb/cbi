@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 # Add mechanisms directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'mechanisms'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'mechanisms'))
 
 from mbi import Dataset, Domain
 from aim import CLAIM
@@ -95,25 +95,39 @@ class AdultPreprocessor:
         return result
     
     def inverse_transform(self, df, original_df=None):
-        """Convert integer-encoded data back to original format."""
+        """Convert integer-encoded data back to original format.
+        
+        This is the inverse of fit_transform.
+        """
         result = pd.DataFrame()
         
         for col in df.columns:
-            if col in self.encoders:
-                inverse_encoder = {v: k for k, v in self.encoders[col].items()}
-                result[col] = df[col].map(lambda x: inverse_encoder.get(int(x) % len(inverse_encoder), 'Unknown'))
-                
+            # Check categorical columns first (same order as fit_transform)
+            if col in self.CATEGORICAL_COLS:
+                if col in self.encoders:
+                    inverse_encoder = {v: k for k, v in self.encoders[col].items()}
+                    result[col] = df[col].apply(
+                        lambda x: inverse_encoder.get(int(x) % len(inverse_encoder), 'Unknown')
+                    )
+                else:
+                    # Encoder not found - keep as-is
+                    result[col] = df[col]
+                    
             elif col in self.BINNING_CONFIG:
                 if col == 'age':
-                    result[col] = df[col].astype(int) + self.age_min
+                    # Inverse of: (value - age_min).clip(0, n_bins-1)
+                    result[col] = df[col].astype(int) + (self.age_min if self.age_min else 17)
                 elif col == 'educational-num':
+                    # Inverse of: (value - 1).clip(0, n_bins-1)
                     result[col] = df[col].astype(int) + 1
                 elif col == 'hours-per-week':
+                    # Inverse of: (value - 1).clip(0, n_bins-1)
                     result[col] = df[col].astype(int) + 1
                 else:
-                    # For other binned columns, use random value within bin
+                    # For other binned columns, keep encoded value
                     result[col] = df[col].astype(int)
             else:
+                # Keep as-is
                 result[col] = df[col]
                 
         return result
@@ -160,17 +174,16 @@ def main():
                         choices=['marginal', 'ate'],
                         help='Selection mode: "marginal" (L1-based) or "ate" (ATE-based)')
     
-    # Causal structure arguments (required for ate mode)
-    parser.add_argument('--treatment', type=str, default='marital-status',
-                        help='Treatment variable name')
-    parser.add_argument('--treatment_value', type=str, default='Married-civ-spouse',
-                        help='Value of treatment that maps to 1 (others become 0)')
-    parser.add_argument('--outcome', type=str, default='income',
-                        help='Outcome variable name')
-    parser.add_argument('--confounders', type=str, default='age,gender,native-country',
-                        help='Comma-separated list of confounders')
+    # Multi-ATE configuration
+    parser.add_argument('--ate_configs_file', type=str, default=None,
+                        help='Path to JSON file with ATE configurations (overrides defaults)')
     parser.add_argument('--causal_graph', type=str, default='causal_graph.dot',
                         help='Path to causal graph DOT file')
+    
+    # Hybrid selection (ATE mode only)
+    parser.add_argument('--marginal_weight', type=float, default=0.3,
+                        help='Weight for L1 marginal error in hybrid selection '
+                             '(0.0 = pure ATE, 1.0 = pure marginal). Only used in ATE mode.')
     
     args = parser.parse_args()
     
@@ -182,28 +195,55 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Parse confounders
-    confounders_list = [c.strip() for c in args.confounders.split(',')]
-    
-    print(f"\nConfiguration:")
-    print(f"  Selection Mode: {args.selection_mode}")
-    print(f"  Epsilon: {args.epsilon}")
-    if args.selection_mode == 'ate':
-        print(f"  Treatment: {args.treatment}")
-        print(f"  Outcome: {args.outcome}")
-        print(f"  Confounders: {confounders_list}")
-    
     # Step 1: Preprocess data
     print("\n[1/4] Preprocessing data...")
     df = pd.read_csv(args.data)
     print(f"  Original records: {len(df)}")
     
-    # Binarize treatment column if in ATE mode
-    if args.selection_mode == 'ate' and args.treatment_value:
-        original_values = df[args.treatment].nunique()
-        treated_count = (df[args.treatment].str.strip() == args.treatment_value).sum()
-        df[args.treatment] = (df[args.treatment].str.strip() == args.treatment_value).astype(int)
-        print(f"  Binarized '{args.treatment}': {treated_count} treated ('{args.treatment_value}'), {len(df) - treated_count} control")
+    # Define default ATE configs for Adult dataset
+    # ATE 1: marital-status (Married-civ-spouse) -> income
+    # ATE 2: educational-num (>9) -> income
+    if args.ate_configs_file:
+        import json
+        with open(args.ate_configs_file, 'r') as f:
+            ate_configs = json.load(f)
+        print(f"  Loaded ATE configs from {args.ate_configs_file}")
+    else:
+        # Default: two ATEs with equal weight, including binarization config
+        ate_configs = [
+            {
+                "name": "marital_status_ate",
+                "treatment": "marital-status",
+                "outcome": "income",
+                "confounders": ["age", "gender", "native-country"],
+                "alpha": 0.5,
+                "binarization": {
+                    "treatment": {"type": "value", "positive_value": 1},  # Encoded: Married-civ-spouse = 1
+                    "outcome": {"type": "value", "positive_value": 1}      # Encoded: >50K = 1
+                }
+            },
+            {
+                "name": "educational_num_ate",
+                "treatment": "educational-num",
+                "outcome": "income",
+                "confounders": ["age", "gender", "native-country"],
+                "alpha": 0.5,
+                "binarization": {
+                    "treatment": {"type": "threshold", "threshold": 8, "comparison": ">"},  # Encoded: >8 means original >9
+                    "outcome": {"type": "value", "positive_value": 1}
+                }
+            }
+        ]
+        print("  Using default ATE configs with binarization: marital-status (α=0.5) + educational-num (α=0.5)")
+    
+    print(f"\nConfiguration:")
+    print(f"  Selection Mode: {args.selection_mode}")
+    print(f"  Epsilon: {args.epsilon}")
+    if args.selection_mode == 'ate':
+        print(f"  ATE Configurations:")
+        for config in ate_configs:
+            print(f"    {config['name']}: T={config['treatment']}, Y={config['outcome']}, α={config['alpha']}")
+        print(f"  Marginal Weight (λ): {args.marginal_weight}")
     
     preprocessor = AdultPreprocessor()
     df_encoded = preprocessor.fit_transform(df)
@@ -251,12 +291,11 @@ def main():
             epsilon=args.epsilon,
             delta=args.delta,
             selection_mode='ate',
-            treatment=args.treatment,
-            outcome=args.outcome,
-            confounders=confounders_list,
+            ate_configs=ate_configs,
             causal_graph_path=args.causal_graph,
             max_model_size=args.max_model_size,
             max_iters=args.max_iters,
+            marginal_weight=args.marginal_weight,
         )
     else:
         mech = CLAIM(
@@ -287,13 +326,24 @@ def main():
     # Final comparison
     print("\n" + "="*60)
     if args.selection_mode == 'ate':
-        print("ATE COMPARISON")
+        print("MULTI-ATE COMPARISON")
         print("="*60)
-        true_ate = mech._true_ate
-        synth_ate = mech.compute_ate_from_data(synth.df)
-        print(f"True ATE: {true_ate:.6f}")
-        print(f"Synthetic ATE: {synth_ate:.6f}")
-        print(f"ATE Error: {abs(true_ate - synth_ate):.6f}")
+        true_ates = mech._true_ates
+        synth_ates = mech.compute_all_ates(synth.df)
+        total_weighted_error = 0.0
+        for config in ate_configs:
+            name = config["name"]
+            alpha = config["alpha"]
+            true_val = true_ates[name]
+            synth_val = synth_ates[name]
+            error = abs(true_val - synth_val)
+            weighted_error = alpha * error
+            total_weighted_error += weighted_error
+            print(f"  {name} (α={alpha}):")
+            print(f"    True ATE:      {true_val:.6f}")
+            print(f"    Synthetic ATE: {synth_val:.6f}")
+            print(f"    Error:         {error:.6f}")
+        print(f"\n  Total Weighted Error: {total_weighted_error:.6f}")
     else:
         print("MARGINAL MODE - No ATE comparison")
         print("="*60)
@@ -306,3 +356,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
