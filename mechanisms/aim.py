@@ -16,6 +16,8 @@ large-cardinality categorical attributes. If there are, we recommend using somet
 "compress_domain" from mst.py.
 """
 
+import gc
+import jax
 import numpy as np
 import itertools
 from mbi import (
@@ -278,6 +280,8 @@ class CLAIM(Mechanism):
         best_error = current_error
         
         for cl in candidates:
+            simulated_model = None
+            simulated_df = None
             try:
                 # Simulate measuring this clique
                 simulated_model = self._simulate_measurement(model, data, cl, measurements)
@@ -294,6 +298,15 @@ class CLAIM(Mechanism):
             except Exception as e:
                 print(f"  Candidate {cl}: failed ({e})")
                 continue
+            finally:
+                # Force cleanup after each candidate to prevent memory accumulation
+                if simulated_model is not None:
+                    del simulated_model
+                if simulated_df is not None:
+                    del simulated_df
+                gc.collect()
+                # Clear JAX JIT compilation caches to prevent LLVM memory buildup
+                jax.clear_caches()
         
         # Fallback: use original L1-based selection if no ATE improvement
         if best_candidate is None:
