@@ -33,6 +33,26 @@ def _build_normalized_marginal(df: pd.DataFrame, cols: list[str]):
     return marginal / total
 
 
+def _build_normalized_marginal_weighted(
+    df: pd.DataFrame, cols: list[str], weight_col: str
+):
+    """
+    Like _build_normalized_marginal but each row contributes ``df[weight_col]``
+    mass instead of 1. Useful for distributions (e.g., model marginals) where
+    the input is one row per cell with a probability column.
+    """
+    if not cols:
+        raise ValueError("cols must be non-empty")
+    if weight_col not in df.columns:
+        raise ValueError(f"weight column '{weight_col}' not in dataframe")
+
+    marginal = df.groupby(cols, dropna=False)[weight_col].sum().astype(float)
+    total = float(marginal.sum())
+    if total <= 0:
+        raise ValueError("Cannot build a marginal from empty / zero-mass dataframe")
+    return marginal / total
+
+
 def _estimate_propensity_from_marginal(
     marginal: pd.Series,
     treatment_col: str,
@@ -75,6 +95,62 @@ def _estimate_propensity_from_marginal(
     return out
 
 
+def _v_from_marginal(
+    marginal: pd.Series,
+    treatment_col: str,
+    adjustment_set: list[str],
+) -> float:
+    """v = sum_cells prob * (T - T̄(Z))^2 from a normalized marginal."""
+    propensity = _estimate_propensity_from_marginal(
+        marginal=marginal,
+        treatment_col=treatment_col,
+        adjustment_set=list(adjustment_set),
+    )
+    v = 0.0
+    for idx, prob in marginal.items():
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        row = dict(zip(marginal.index.names, idx))
+        t_val = float(row[treatment_col])
+        z_val = tuple(row[c] for c in adjustment_set) if adjustment_set else ()
+        t_bar = float(propensity.get(z_val, 0.0))
+        v += float(prob) * ((t_val - t_bar) ** 2)
+    return float(v)
+
+
+def _ate_from_marginal(
+    marginal: pd.Series,
+    treatment_col: str,
+    outcome_col: str,
+    adjustment_set: list[str],
+) -> float:
+    """FWL ATE estimator from a normalized marginal over (T, Y, *Z)."""
+    propensity = _estimate_propensity_from_marginal(
+        marginal=marginal,
+        treatment_col=treatment_col,
+        adjustment_set=list(adjustment_set),
+    )
+    v = 0.0
+    numerator = 0.0
+    for idx, prob in marginal.items():
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        row = dict(zip(marginal.index.names, idx))
+        t_val = float(row[treatment_col])
+        y_val = float(row[outcome_col])
+        z_val = tuple(row[c] for c in adjustment_set) if adjustment_set else ()
+        t_bar = float(propensity.get(z_val, 0.0))
+        residual_t = t_val - t_bar
+        v += float(prob) * (residual_t ** 2)
+        numerator += float(prob) * y_val * residual_t
+
+    if v <= 0:
+        raise ValueError(
+            "Degenerate treatment variance v=0. Consider clipping v or checking positivity."
+        )
+    return float(numerator / v)
+
+
 def claim_fwl_v(
     df: pd.DataFrame,
     treatment_col: str,
@@ -98,23 +174,51 @@ def claim_fwl_v(
 
     data = _minmax_scale_df(df[cols], {c: bounds[c] for c in cols})
     marginal = _build_normalized_marginal(data, cols)
-    propensity = _estimate_propensity_from_marginal(
-        marginal=marginal,
-        treatment_col=treatment_col,
-        adjustment_set=list(adjustment_set),
-    )
+    return _v_from_marginal(marginal, treatment_col, list(adjustment_set))
 
-    v = 0.0
-    for idx, prob in marginal.items():
-        if not isinstance(idx, tuple):
-            idx = (idx,)
-        row = dict(zip(marginal.index.names, idx))
-        t_val = float(row[treatment_col])
-        z_val = tuple(row[c] for c in adjustment_set) if adjustment_set else ()
-        t_bar = float(propensity.get(z_val, 0.0))
-        v += float(prob) * ((t_val - t_bar) ** 2)
 
-    return float(v)
+def claim_fwl_ate_from_distribution(
+    df: pd.DataFrame,
+    treatment_col: str,
+    outcome_col: str,
+    adjustment_set: list[str],
+    bounds: dict[str, tuple[float, float]],
+    weight_col: str = "_w",
+) -> float:
+    """
+    FWL ATE estimator over a *weighted* distribution.
+
+    Each row in ``df`` is interpreted as one cell of an empirical or model
+    distribution carrying mass ``df[weight_col]``. Useful for evaluating ATE
+    on a PGM model's joint marginal without sampling: project the model to
+    the joint over (T, Y, *Z), enumerate cells into rows, and pass the
+    per-cell probability as the weight.
+
+    Parameters mirror ``claim_fwl_ate_estimator`` except for ``weight_col``,
+    the name of the per-row mass column.
+    """
+    if treatment_col == outcome_col:
+        raise ValueError("treatment_col and outcome_col must be different")
+    if len(set(adjustment_set)) != len(adjustment_set):
+        raise ValueError("adjustment_set must not contain duplicate columns")
+    if treatment_col in adjustment_set or outcome_col in adjustment_set:
+        raise ValueError("adjustment_set must not contain treatment or outcome columns")
+
+    cols = [treatment_col, outcome_col] + list(adjustment_set)
+    missing_cols = [c for c in cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing dataframe columns: {missing_cols}")
+    if weight_col not in df.columns:
+        raise ValueError(f"Missing weight column: '{weight_col}'")
+    missing_bounds = [c for c in cols if c not in bounds]
+    if missing_bounds:
+        raise ValueError(f"Missing bounds for columns: {missing_bounds}")
+
+    scaled = _minmax_scale_df(df[cols], {c: bounds[c] for c in cols})
+    scaled[weight_col] = df[weight_col].values
+
+    marginal = _build_normalized_marginal_weighted(scaled, cols, weight_col)
+    return _ate_from_marginal(marginal, treatment_col, outcome_col, list(adjustment_set))
 
 
 def claim_fwl_ate_estimator(
@@ -176,40 +280,5 @@ def claim_fwl_ate_estimator(
         raise ValueError(f"Missing bounds for columns: {missing_bounds}")
 
     data = _minmax_scale_df(df[cols], {c: bounds[c] for c in cols})
-
-    # Build normalized marginal M_r(D).
     marginal = _build_normalized_marginal(data, cols)
-
-    # Estimate propensity \bar{T}(z).
-    propensity = _estimate_propensity_from_marginal(
-        marginal=marginal,
-        treatment_col=treatment_col,
-        adjustment_set=adjustment_set,
-    )
-
-    # Compute v = E[(T - \bar{T}(Z))^2].
-    v = 0.0
-    numerator = 0.0
-
-    for idx, prob in marginal.items():
-        if not isinstance(idx, tuple):
-            idx = (idx,)
-        row = dict(zip(marginal.index.names, idx))
-
-        t_val = float(row[treatment_col])
-        y_val = float(row[outcome_col])
-        z_val = tuple(row[c] for c in adjustment_set) if adjustment_set else ()
-
-        t_bar = float(propensity.get(z_val, 0.0))
-        residual_t = t_val - t_bar
-
-        v += float(prob) * (residual_t ** 2)
-        numerator += float(prob) * y_val * residual_t
-
-    if v <= 0:
-        raise ValueError(
-            "Degenerate treatment variance v=0. Consider clipping v or checking positivity."
-        )
-
-    ate_hat = numerator / v
-    return float(ate_hat)
+    return _ate_from_marginal(marginal, treatment_col, outcome_col, list(adjustment_set))

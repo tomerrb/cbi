@@ -397,12 +397,12 @@ class CLAIM(Mechanism):
 
     def _model_to_dataframe(self, model, num_samples, seed=None):
         """Generate synthetic DataFrame from PGM model with optional seed for reproducibility.
-        
+
         Args:
             model: Fitted PGM model.
             num_samples: Number of samples to generate.
             seed: Optional random seed for reproducibility.
-            
+
         Returns:
             DataFrame: Synthetic data.
         """
@@ -410,6 +410,65 @@ class CLAIM(Mechanism):
             np.random.seed(seed)
         synth = model.synthetic_data(rows=num_samples)
         return synth.df
+
+    def _factor_to_weighted_df(self, factor, weight_col="_w"):
+        """Flatten a PGM Factor into a one-row-per-cell DataFrame with a normalized weight column.
+
+        The Factor's values are interpreted as joint masses; rows enumerate
+        attribute cells in row-major (C) order — matching ``factor.values.ravel()``
+        and ``itertools.product(*[range(s) for s in sizes])``. The weight column
+        is normalized so it sums to 1.
+
+        Args:
+            factor: PGM Factor over the attributes of interest.
+            weight_col: Name of the normalized-mass column on the output.
+
+        Returns:
+            DataFrame with one row per cell, columns = factor attributes + weight_col.
+        """
+        attrs = list(factor.domain.attrs)
+        sizes = [factor.domain.size(a) for a in attrs]
+        flat = np.asarray(factor.values).ravel()
+        total = float(flat.sum())
+        if total <= 0:
+            raise ValueError("Cannot flatten an empty / zero-mass factor")
+        probs = flat / total
+
+        cells = list(itertools.product(*[range(s) for s in sizes]))
+        out = {a: [c[i] for c in cells] for i, a in enumerate(attrs)}
+        out[weight_col] = probs
+        return pd.DataFrame(out)
+
+    def _ate_from_model(self, model, config):
+        """Compute FWL ATE on the model's joint distribution, no sampling.
+
+        Projects the model to the joint over (T, Y, *Z), binarizes T and Y
+        per the config, and runs claim_fwl_ate_from_distribution on the
+        resulting weighted cell DataFrame.
+
+        Only valid when self.ate_method == "fwl".
+        """
+        from fwl import claim_fwl_ate_from_distribution
+
+        treatment = config["treatment"]
+        outcome = config["outcome"]
+        confounders = list(config["confounders"])
+        cols = (treatment, outcome, *confounders)
+
+        factor = model.project(cols)
+        df_cells = self._factor_to_weighted_df(factor)
+
+        # Preserve the per-cell weight across binarization (which only edits T/Y).
+        df_binary = self._binarize_for_ate(df_cells, config)
+
+        bounds = {k: tuple(v) for k, v in config["bounds"].items()}
+        return claim_fwl_ate_from_distribution(
+            df=df_binary,
+            treatment_col=treatment,
+            outcome_col=outcome,
+            adjustment_set=confounders,
+            bounds=bounds,
+        )
 
     def _simulate_measurement(self, model, data, clique, measurements):
         """Simulate measuring a clique without actually adding noise.
