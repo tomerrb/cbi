@@ -75,6 +75,48 @@ def _estimate_propensity_from_marginal(
     return out
 
 
+def claim_fwl_v(
+    df: pd.DataFrame,
+    treatment_col: str,
+    adjustment_set: list[str],
+    bounds: dict[str, tuple[float, float]],
+) -> float:
+    """
+    Compute v = E_D[(T - \\bar{T}(Z))^2] from the scaled empirical marginal.
+
+    This is the denominator of the CLAIM-style FWL ATE estimator. It is
+    exposed separately so callers (e.g. CLAIM's selection step) can build
+    the kappa factor kappa = 1 / sum_i (beta_i / v_i) without recomputing
+    the ATE.
+
+    All used variables are first scaled to [0, 1] according to ``bounds``.
+    """
+    cols = [treatment_col] + list(adjustment_set)
+    missing = [c for c in cols if c not in bounds]
+    if missing:
+        raise ValueError(f"Missing bounds for columns: {missing}")
+
+    data = _minmax_scale_df(df[cols], {c: bounds[c] for c in cols})
+    marginal = _build_normalized_marginal(data, cols)
+    propensity = _estimate_propensity_from_marginal(
+        marginal=marginal,
+        treatment_col=treatment_col,
+        adjustment_set=list(adjustment_set),
+    )
+
+    v = 0.0
+    for idx, prob in marginal.items():
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        row = dict(zip(marginal.index.names, idx))
+        t_val = float(row[treatment_col])
+        z_val = tuple(row[c] for c in adjustment_set) if adjustment_set else ()
+        t_bar = float(propensity.get(z_val, 0.0))
+        v += float(prob) * ((t_val - t_bar) ** 2)
+
+    return float(v)
+
+
 def claim_fwl_ate_estimator(
     df: pd.DataFrame,
     treatment_col: str,

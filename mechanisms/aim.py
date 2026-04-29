@@ -141,6 +141,10 @@ class CLAIM(Mechanism):
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
         self._true_ates = {}  # Dict of {name: true_ate_value}
+        # FWL components cached at the start of run() (ate_method="fwl" only):
+        # v_i = E_D[(T_i - T̄(Z_i))^2] per ATE config and κ = 1 / Σ_i β_i / v_i
+        self._fwl_v = {}
+        self._fwl_kappa = None
 
         # Hybrid selection configuration
         self.marginal_weight = marginal_weight
@@ -321,10 +325,10 @@ class CLAIM(Mechanism):
 
     def compute_all_ates(self, df):
         """Compute all configured ATEs from a DataFrame.
-        
+
         Args:
             df: DataFrame containing all required columns (encoded).
-            
+
         Returns:
             dict: {ate_name: ate_value} for each configured ATE.
         """
@@ -333,6 +337,45 @@ class CLAIM(Mechanism):
             ate_value = self.compute_ate_from_data(df, config)
             ates[config["name"]] = ate_value
         return ates
+
+    def _compute_fwl_v_for_config(self, df, config):
+        """Compute v_i = E_D[(T_i - T̄(Z_i))^2] for a single ATE config.
+
+        Uses the same binarization and bounds as the FWL ATE estimator so the
+        v values stay consistent with τ_i^*.
+        """
+        from fwl import claim_fwl_v
+
+        df_binary = self._binarize_for_ate(df, config)
+        bounds = {k: tuple(v) for k, v in config["bounds"].items()}
+        return claim_fwl_v(
+            df=df_binary,
+            treatment_col=config["treatment"],
+            adjustment_set=list(config["confounders"]),
+            bounds=bounds,
+        )
+
+    def _cache_fwl_components(self, df):
+        """Cache v_i for each ATE and the κ scaling factor used in q_r.
+
+        κ = 1 / Σ_i (β_i / v_i), where β_i is the per-ATE weight (config['alpha']).
+        Called once at the start of run() when ate_method='fwl'.
+        """
+        self._fwl_v = {
+            config["name"]: self._compute_fwl_v_for_config(df, config)
+            for config in self.ate_configs
+        }
+        denom = 0.0
+        for config in self.ate_configs:
+            v_i = self._fwl_v[config["name"]]
+            if v_i <= 0:
+                raise ValueError(
+                    f"Degenerate v_i=0 for ATE '{config['name']}'; cannot form κ."
+                )
+            denom += config["alpha"] / v_i
+        if denom <= 0:
+            raise ValueError("Cannot compute FWL κ: denominator is zero")
+        self._fwl_kappa = 1.0 / denom
 
     def compute_weighted_ate_error(self, true_ates, model_ates):
         """Compute weighted sum of ATE errors: Σ α_i * |true_i - model_i|.
@@ -606,7 +649,19 @@ class CLAIM(Mechanism):
                 name = config["name"]
                 alpha = config["alpha"]
                 print(f"  {name} (α={alpha}): {self._true_ates[name]:.6f}")
-        
+
+            if self.ate_method == "fwl":
+                # TODO(DP): v_i and κ are derived from raw D and currently used
+                # without DP accounting. See claim_algorithm_fwl.tex for the κ
+                # role in q_r(D); a public-bound or noised substitute is needed
+                # before the FWL path is fully DP.
+                self._cache_fwl_components(data.df)
+                print("FWL components:")
+                for config in self.ate_configs:
+                    name = config["name"]
+                    print(f"  v[{name}] = {self._fwl_v[name]:.6f}")
+                print(f"  κ = {self._fwl_kappa:.6f}")
+
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
         answers = {cl: data.project(cl).datavector() for cl in candidates}
