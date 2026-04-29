@@ -473,23 +473,32 @@ class CLAIM(Mechanism):
         # Deterministic: pick max error
         return max(errors, key=errors.get)
 
-    def _compute_l1_scores(self, candidates, answers, model):
-        """Compute L1 error scores for all candidates.
-        
+    def _compute_stat_term(self, candidates, answers, model, sigma):
+        """Statistical term L_r(D) for the FWL/ATE path.
+
+        Per claim_algorithm_fwl.tex (line:stat-term):
+            L_r(D) = ||M_r(D) - M_r(p̂)||_1 - sqrt(2/π) · σ_t · n_r
+
+        Workload weights w_r are intentionally dropped (line:remove-wr); all
+        candidates are weighted equally.
+
         Args:
-            candidates: Dict of candidate cliques with weights.
-            answers: Dict of true marginals.
-            model: Current fitted model.
-            
+            candidates: Dict of candidate cliques (values, the legacy w_r
+                weights, are ignored here).
+            answers: Dict of true marginals M_r(D) as count vectors.
+            model: Current fitted model p̂.
+            sigma: Current Gaussian-noise stddev σ_t.
+
         Returns:
-            dict: {clique: L1_error_score}
+            dict: {clique: L_r(D)}
         """
         scores = {}
         for cl in candidates:
-            wgt = candidates[cl]
             x = answers[cl]
             xest = model.project(cl).datavector()
-            scores[cl] = wgt * np.linalg.norm(x - xest, 1)
+            n_r = model.domain.size(cl)
+            bias = np.sqrt(2 / np.pi) * sigma * n_r
+            scores[cl] = np.linalg.norm(x - xest, 1) - bias
         return scores
 
     def _normalize_scores(self, scores):
@@ -535,8 +544,8 @@ class CLAIM(Mechanism):
         # Use cached true ATEs
         true_ates = self._true_ates
         
-        # Step 1: Compute L1 scores (fast, no simulation)
-        l1_scores = self._compute_l1_scores(candidates, answers, model)
+        # Step 1: Compute statistical term L_r(D) (fast, no simulation)
+        l1_scores = self._compute_stat_term(candidates, answers, model, sigma)
         
         # Step 2: Compute ATE improvement scores (requires simulation)
         ate_scores = {}
