@@ -117,37 +117,42 @@ class CLAIM(Mechanism):
         ate_sample_size=10000,
         sim_sample_size=5000,
         marginal_weight=0.3,
+        ate_method="dowhy",
     ):
         super(CLAIM, self).__init__(epsilon, delta, prng)
         self.rounds = rounds
         self.max_iters = max_iters
         self.max_model_size = max_model_size
         self.structural_zeros = structural_zeros
-        
+
         # Selection mode configuration
         self.selection_mode = selection_mode
         if selection_mode not in ("marginal", "ate"):
             raise ValueError(f"selection_mode must be 'marginal' or 'ate', got '{selection_mode}'")
-        
+
+        # ATE estimation backend
+        if ate_method not in ("dowhy", "fwl"):
+            raise ValueError(f"ate_method must be 'dowhy' or 'fwl', got '{ate_method}'")
+        self.ate_method = ate_method
+
         # ATE mode configuration
         self.ate_configs = ate_configs or []
         self.ate_sample_size = ate_sample_size
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
         self._true_ates = {}  # Dict of {name: true_ate_value}
-        
+
         # Hybrid selection configuration
         self.marginal_weight = marginal_weight
         if not (0.0 <= marginal_weight <= 1.0):
             raise ValueError(f"marginal_weight must be in [0, 1], got {marginal_weight}")
-        
+
         if selection_mode == "ate":
-            # Validate required causal parameters
-            if not ate_configs or not causal_graph_path:
-                raise ValueError(
-                    "ATE mode requires ate_configs (list of ATE configurations) and causal_graph_path"
-                )
-            
+            if not ate_configs:
+                raise ValueError("ATE mode requires ate_configs (list of ATE configurations)")
+            if ate_method == "dowhy" and not causal_graph_path:
+                raise ValueError("ATE mode with ate_method='dowhy' requires causal_graph_path")
+
             # Validate each ATE config
             for i, config in enumerate(ate_configs):
                 required_keys = ["name", "treatment", "outcome", "confounders", "alpha"]
@@ -156,7 +161,19 @@ class CLAIM(Mechanism):
                         raise ValueError(f"ATE config {i} missing required key: '{key}'")
                 if not (0 <= config["alpha"] <= 1):
                     raise ValueError(f"ATE config '{config['name']}' alpha must be in [0, 1], got {config['alpha']}")
-            
+
+                if ate_method == "fwl":
+                    if "bounds" not in config:
+                        raise ValueError(
+                            f"ATE config '{config['name']}' missing required key 'bounds' for ate_method='fwl'"
+                        )
+                    needed = [config["treatment"], config["outcome"], *config["confounders"]]
+                    missing = [c for c in needed if c not in config["bounds"]]
+                    if missing:
+                        raise ValueError(
+                            f"ATE config '{config['name']}' bounds missing entries for: {missing}"
+                        )
+
             # Validate alpha weights sum to 1
             alpha_sum = sum(config["alpha"] for config in ate_configs)
             if abs(alpha_sum - 1.0) > 1e-6:
@@ -164,10 +181,11 @@ class CLAIM(Mechanism):
                     f"ATE alpha weights must sum to 1.0, got {alpha_sum:.6f}. "
                     f"Weights: {[config['alpha'] for config in ate_configs]}"
                 )
-            
-            # Load GML causal graph (shared across all ATEs)
-            with open(causal_graph_path, 'r') as f:
-                self.causal_graph = f.read()
+
+            # Load GML causal graph (shared across all ATEs) — DoWhy only
+            if ate_method == "dowhy":
+                with open(causal_graph_path, 'r') as f:
+                    self.causal_graph = f.read()
 
     def _binarize_for_ate(self, df, config):
         """Apply binarization to treatment and outcome columns for ATE calculation.
@@ -251,37 +269,54 @@ class CLAIM(Mechanism):
         return df
 
     def compute_ate_from_data(self, df, config):
-        """Compute ATE for a single treatment-outcome pair using DoWhy's backdoor adjustment.
-        
+        """Compute ATE for a single treatment-outcome pair.
+
+        Dispatches on self.ate_method:
+          - "dowhy": DoWhy CausalModel with backdoor.linear_regression.
+          - "fwl":   CLAIM-style FWL estimator from fwl.claim_fwl_ate_estimator.
+
         Args:
             df: DataFrame containing treatment, outcome, and confounder columns (encoded).
-            config: ATE config dict with treatment, outcome, and optional binarization.
-            
+            config: ATE config dict with treatment, outcome, optional binarization,
+                and (for FWL) a 'bounds' dict.
+
         Returns:
             float: Estimated ATE value.
         """
-        # Late import to avoid dependency when not using ATE mode
-        from dowhy import CausalModel
-        
         treatment = config["treatment"]
         outcome = config["outcome"]
-        
+
         # Apply binarization for ATE calculation
         df_binary = self._binarize_for_ate(df, config)
-        
+
+        if self.ate_method == "fwl":
+            from fwl import claim_fwl_ate_estimator
+
+            bounds = {k: tuple(v) for k, v in config["bounds"].items()}
+            return claim_fwl_ate_estimator(
+                df=df_binary,
+                treatment_col=treatment,
+                outcome_col=outcome,
+                adjustment_set=list(config["confounders"]),
+                bounds=bounds,
+            )
+
+        # Default: DoWhy backdoor adjustment
+        from dowhy import CausalModel
+
         model = CausalModel(
             data=df_binary,
             treatment=treatment,
             outcome=outcome,
             graph=self.causal_graph
         )
-        
+
         identified_estimand = model.identify_effect(proceed_when_unidentifiable=True)
         estimate = model.estimate_effect(
             identified_estimand,
             method_name="backdoor.linear_regression"
         )
-        
+
         return estimate.value
 
     def compute_all_ates(self, df):
@@ -680,6 +715,8 @@ def default_params():
     params["causal_graph"] = None
     # Hybrid selection weight: 0.0 = pure ATE, 1.0 = pure marginal
     params["marginal_weight"] = 0.3
+    # ATE estimation backend: "dowhy" or "fwl"
+    params["ate_method"] = "dowhy"
 
     return params
 
@@ -735,6 +772,13 @@ if __name__ == "__main__":
         help="Weight for L1 marginal error in hybrid selection (0.0 = pure ATE, 1.0 = pure marginal)."
              " Only used when selection_mode='ate'. Default: 0.3"
     )
+    parser.add_argument(
+        "--ate_method",
+        type=str,
+        choices=["dowhy", "fwl"],
+        help="ATE estimation backend: 'dowhy' (CausalModel + backdoor) or 'fwl' "
+             "(claim_fwl_ate_estimator from fwl.py). 'fwl' requires per-config 'bounds'."
+    )
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
@@ -766,6 +810,7 @@ if __name__ == "__main__":
         ate_configs=ate_configs_list,
         causal_graph_path=args.causal_graph,
         marginal_weight=args.marginal_weight,
+        ate_method=args.ate_method,
     )
     model, synth = mech.run(data, workload)
 

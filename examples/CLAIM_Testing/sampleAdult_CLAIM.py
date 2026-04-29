@@ -184,6 +184,13 @@ def main():
     parser.add_argument('--marginal_weight', type=float, default=0.3,
                         help='Weight for L1 marginal error in hybrid selection '
                              '(0.0 = pure ATE, 1.0 = pure marginal). Only used in ATE mode.')
+
+    # ATE estimation backend (ATE mode only)
+    parser.add_argument('--ate_method', type=str, default='dowhy',
+                        choices=['dowhy', 'fwl'],
+                        help="ATE backend: 'dowhy' (CausalModel + backdoor) or 'fwl' "
+                             "(claim_fwl_ate_estimator). 'fwl' skips the causal graph and "
+                             "uses per-confounder bounds derived from the encoded domain.")
     
     args = parser.parse_args()
     
@@ -240,6 +247,7 @@ def main():
     print(f"  Selection Mode: {args.selection_mode}")
     print(f"  Epsilon: {args.epsilon}")
     if args.selection_mode == 'ate':
+        print(f"  ATE Method: {args.ate_method}")
         print(f"  ATE Configurations:")
         for config in ate_configs:
             print(f"    {config['name']}: T={config['treatment']}, Y={config['outcome']}, α={config['alpha']}")
@@ -247,6 +255,23 @@ def main():
     
     preprocessor = AdultPreprocessor()
     df_encoded = preprocessor.fit_transform(df)
+
+    # If using FWL backend, attach per-config bounds derived from the encoded domain.
+    # Treatment and outcome are binarized -> [0, 1]; confounders span [0, cardinality - 1].
+    if args.selection_mode == 'ate' and args.ate_method == 'fwl':
+        for config in ate_configs:
+            bounds = {
+                config['treatment']: [0, 1],
+                config['outcome']: [0, 1],
+            }
+            for c in config['confounders']:
+                if c not in preprocessor.domain_config:
+                    raise ValueError(
+                        f"Confounder '{c}' not found in encoded domain; cannot derive FWL bounds"
+                    )
+                bounds[c] = [0, preprocessor.domain_config[c] - 1]
+            config['bounds'] = bounds
+        print("  Injected FWL bounds into ATE configs")
     
     # Save domain
     domain_path = os.path.join(args.output_dir, 'domain.json')
@@ -292,10 +317,11 @@ def main():
             delta=args.delta,
             selection_mode='ate',
             ate_configs=ate_configs,
-            causal_graph_path=args.causal_graph,
+            causal_graph_path=(args.causal_graph if args.ate_method == 'dowhy' else None),
             max_model_size=args.max_model_size,
             max_iters=args.max_iters,
             marginal_weight=args.marginal_weight,
+            ate_method=args.ate_method,
         )
     else:
         mech = CLAIM(
