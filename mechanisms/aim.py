@@ -560,21 +560,26 @@ class CLAIM(Mechanism):
             scores[cl] = np.linalg.norm(x - xest, 1) - bias
         return scores
 
-    def worst_ate_approximated(self, candidates, answers, data, model, measurements, sigma):
-        """Select marginal using hybrid strategy combining ATE and L1 scores.
-        
-        Uses marginal_weight to balance between:
-        - L1 error scores (how poorly each marginal is approximated)
-        - ATE improvement scores (how much each marginal improves ATE estimation)
-        
+    def worst_ate_approximated(
+        self, candidates, answers, data, model, measurements, epsilon, sigma
+    ):
+        """Select marginal r_t via the exponential mechanism with quality q_r(D).
+
+        Implements claim_algorithm_fwl.tex line:quality-score:
+            q_r(D) = λ · L_r(D) + (1 - λ) · κ · A_r(D)
+        with λ = self.marginal_weight, κ = self._fwl_kappa, L_r from
+        _compute_stat_term, and A_r from per-ATE short-circuits + sampling-free
+        evaluation.
+
         Args:
-            candidates: Dict of candidate cliques with weights.
-            answers: Dict of true marginals.
+            candidates: Dict of candidate cliques (workload weights ignored).
+            answers: Dict of true marginals M_r(D) as count vectors.
             data: Original Dataset.
-            model: Current fitted model.
-            measurements: Current list of measurements.
-            sigma: Noise standard deviation.
-            
+            model: Current fitted PGM model p̂_{t-1}.
+            measurements: Current list of measurements (for refits).
+            epsilon: ε_t for the exponential mechanism.
+            sigma: σ_t for the bias-correction term in L_r.
+
         Returns:
             tuple: Selected clique.
         """
@@ -673,15 +678,33 @@ class CLAIM(Mechanism):
                 + (1 - self.marginal_weight) * kappa * ate_score
             )
 
-        # Step 4: argmax (exponential mechanism swap lands in the next step).
-        best_candidate = max(combined_scores, key=combined_scores.get)
+        # Step 4: Exponential mechanism on q_r(D).
+        # Sensitivity bound:
+        #   ΔL_r ≤ 2 (count L1 of M_r is 2-sensitive under add/remove; the
+        #   bias term sqrt(2/π)·σ_t·n_r is data-independent).
+        # TODO(DP): ΔA_r is not bounded today. The FWL estimator τ̂ has
+        # data-dependent sensitivity (driven by per-cell propensity supports
+        # and v). Treating ΔA_r as 1 here is a placeholder so the EM call
+        # has the right shape; calibrating it properly requires either row
+        # clipping on τ̂ or a public-bound substitute for the per-cell terms,
+        # both deferred per the plan.
+        delta_l = 2.0
+        delta_a = 1.0
+        sensitivity = (
+            self.marginal_weight * delta_l
+            + (1 - self.marginal_weight) * abs(kappa) * delta_a
+        )
+
+        best_candidate = self.exponential_mechanism(
+            combined_scores, epsilon, sensitivity
+        )
         best_combined = combined_scores[best_candidate]
         best_l1 = l1_scores.get(best_candidate, 0.0)
         best_ate = ate_scores.get(best_candidate, 0.0)
 
         print(
-            f"Selected {best_candidate}: L_r={best_l1:.3f}, "
-            f"A_r={best_ate:.3f}, κ={kappa:.3f}, q_r={best_combined:.3f}"
+            f"Selected {best_candidate} (EM, ε={epsilon:.3f}, Δq={sensitivity:.3f}): "
+            f"L_r={best_l1:.3f}, A_r={best_ate:.3f}, κ={kappa:.3f}, q_r={best_combined:.3f}"
         )
         
         return best_candidate
@@ -785,7 +808,8 @@ class CLAIM(Mechanism):
             # Branch on selection mode
             if self.selection_mode == "ate":
                 cl = self.worst_ate_approximated(
-                    small_candidates, answers, data, model, measurements, sigma
+                    small_candidates, answers, data, model, measurements,
+                    epsilon, sigma,
                 )
             else:
                 cl = self.worst_approximated(
