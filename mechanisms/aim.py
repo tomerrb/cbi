@@ -606,14 +606,18 @@ class CLAIM(Mechanism):
         # Step 1: Compute statistical term L_r(D) (fast, no simulation)
         l1_scores = self._compute_stat_term(candidates, answers, model, sigma)
         
-        # Step 2: Compute ATE improvement scores (requires simulation)
+        # Step 2: Compute causal term A_r(D)
+        # A_r(D) = Σ β_i [|τ_i* - τ_i(p̂_{t-1})|  -  |τ_i* - τ̂_i^r(D)|]
+        # All ATEs are evaluated directly on PGM marginals — no Monte Carlo.
         ate_scores = {}
-        
-        # Current model's ATEs (use fixed seed for consistency)
-        current_model_df = self._model_to_dataframe(model, self.sim_sample_size, seed=42)
-        current_ates = self.compute_all_ates(current_model_df)
+
+        # Current model ATEs τ_i(p̂_{t-1}) — sampling-free
+        current_ates = {
+            cfg["name"]: self._ate_from_model(model, cfg)
+            for cfg in self.ate_configs
+        }
         current_error = self.compute_weighted_ate_error(true_ates, current_ates)
-        
+
         # Print current status for each ATE
         print(f"Current weighted ATE error: {current_error:.6f}")
         print(f"Hybrid selection: marginal_weight={self.marginal_weight:.2f}")
@@ -623,36 +627,59 @@ class CLAIM(Mechanism):
             true_val = true_ates[name]
             model_val = current_ates[name]
             print(f"  {name} (α={alpha}): true={true_val:.4f}, model={model_val:.4f}, error={abs(true_val - model_val):.4f}")
-        
+
+        # Pre-compute per-ATE attribute sets so we can short-circuit per candidate.
+        ate_attr_sets = [
+            (cfg, {cfg["treatment"], cfg["outcome"], *cfg["confounders"]})
+            for cfg in self.ate_configs
+        ]
+
         for cl in candidates:
-            simulated_model = None
-            simulated_df = None
+            cl_set = set(cl)
+            # Classify each ATE wrt the candidate clique:
+            #   "supset"   — cl ⊇ ATE's (T,Y,Z): selecting cl reveals the joint, τ̂^r = τ*
+            #   "disjoint" — cl ∩ (T,Y,Z) = ∅: cl carries no info about τ_i, τ̂^r = τ(p̂_{t-1})
+            #   "partial"  — partial overlap: requires a refit to evaluate τ̂^r
+            relations = []
+            needs_refit = False
+            for cfg, ate_set in ate_attr_sets:
+                if ate_set <= cl_set:
+                    relations.append(("supset", cfg))
+                elif cl_set & ate_set:
+                    relations.append(("partial", cfg))
+                    needs_refit = True
+                else:
+                    relations.append(("disjoint", cfg))
+
+            sim_model = None
             try:
-                # Simulate measuring this clique
-                simulated_model = self._simulate_measurement(model, data, cl, measurements)
-                
-                # Compute all ATEs with fixed seed
-                simulated_df = self._model_to_dataframe(simulated_model, self.sim_sample_size, seed=42)
-                simulated_ates = self.compute_all_ates(simulated_df)
+                if needs_refit:
+                    # TODO(DP): _simulate_measurement reads data.project(cl) with
+                    # stddev=1e-10. This raw-marginal access is non-DP and is
+                    # tracked separately in the DP plan.
+                    sim_model = self._simulate_measurement(model, data, cl, measurements)
+
+                simulated_ates = {}
+                for relation, cfg in relations:
+                    name = cfg["name"]
+                    if relation == "supset":
+                        simulated_ates[name] = true_ates[name]
+                    elif relation == "disjoint":
+                        simulated_ates[name] = current_ates[name]
+                    else:  # partial
+                        simulated_ates[name] = self._ate_from_model(sim_model, cfg)
+
                 simulated_error = self.compute_weighted_ate_error(true_ates, simulated_ates)
-                
-                # ATE improvement score (higher = better improvement)
-                # We use current_error - simulated_error so positive means improvement
                 ate_scores[cl] = current_error - simulated_error
-                
+
             except Exception as e:
                 print(f"  Candidate {cl}: failed ({e})")
-                # Assign zero improvement score if simulation fails
                 ate_scores[cl] = 0.0
             finally:
-                # Force cleanup after each candidate to prevent memory accumulation
-                if simulated_model is not None:
-                    del simulated_model
-                if simulated_df is not None:
-                    del simulated_df
-                gc.collect()
-                # Clear JAX JIT compilation caches to prevent LLVM memory buildup
-                jax.clear_caches()
+                if sim_model is not None:
+                    del sim_model
+                    gc.collect()
+                    jax.clear_caches()
         
         # Step 3: Normalize both score sets to [0, 1]
         l1_normalized = self._normalize_scores(l1_scores)
