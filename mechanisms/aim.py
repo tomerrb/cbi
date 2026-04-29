@@ -560,28 +560,6 @@ class CLAIM(Mechanism):
             scores[cl] = np.linalg.norm(x - xest, 1) - bias
         return scores
 
-    def _normalize_scores(self, scores):
-        """Normalize scores to [0, 1] range using min-max normalization.
-        
-        Args:
-            scores: Dict of {clique: score}.
-            
-        Returns:
-            dict: {clique: normalized_score} in [0, 1] range.
-        """
-        if not scores:
-            return {}
-        
-        values = list(scores.values())
-        min_val = min(values)
-        max_val = max(values)
-        
-        # Avoid division by zero if all scores are equal
-        if max_val - min_val < 1e-10:
-            return {cl: 0.5 for cl in scores}
-        
-        return {cl: (s - min_val) / (max_val - min_val) for cl, s in scores.items()}
-
     def worst_ate_approximated(self, candidates, answers, data, model, measurements, sigma):
         """Select marginal using hybrid strategy combining ATE and L1 scores.
         
@@ -681,28 +659,30 @@ class CLAIM(Mechanism):
                     gc.collect()
                     jax.clear_caches()
         
-        # Step 3: Normalize both score sets to [0, 1]
-        l1_normalized = self._normalize_scores(l1_scores)
-        ate_normalized = self._normalize_scores(ate_scores)
-        
-        # Step 4: Combine with marginal_weight
-        # combined = λ * L1 + (1-λ) * ATE
+        # Step 3: Combine on the absolute scale per claim_algorithm_fwl.tex
+        # (line:quality-score):
+        #     q_r(D) = λ · L_r(D) + (1 - λ) · κ · A_r(D)
+        # κ is cached in self._fwl_kappa from _cache_fwl_components.
+        kappa = self._fwl_kappa
         combined_scores = {}
         for cl in candidates:
-            l1_score = l1_normalized.get(cl, 0.0)
-            ate_score = ate_normalized.get(cl, 0.0)
+            l1_score = l1_scores.get(cl, 0.0)
+            ate_score = ate_scores.get(cl, 0.0)
             combined_scores[cl] = (
-                self.marginal_weight * l1_score + 
-                (1 - self.marginal_weight) * ate_score
+                self.marginal_weight * l1_score
+                + (1 - self.marginal_weight) * kappa * ate_score
             )
-        
-        # Step 5: Select best candidate (highest combined score)
+
+        # Step 4: argmax (exponential mechanism swap lands in the next step).
         best_candidate = max(combined_scores, key=combined_scores.get)
         best_combined = combined_scores[best_candidate]
-        best_l1 = l1_normalized.get(best_candidate, 0.0)
-        best_ate = ate_normalized.get(best_candidate, 0.0)
-        
-        print(f"Selected {best_candidate}: L1={best_l1:.3f}, ATE={best_ate:.3f}, combined={best_combined:.3f}")
+        best_l1 = l1_scores.get(best_candidate, 0.0)
+        best_ate = ate_scores.get(best_candidate, 0.0)
+
+        print(
+            f"Selected {best_candidate}: L_r={best_l1:.3f}, "
+            f"A_r={best_ate:.3f}, κ={kappa:.3f}, q_r={best_combined:.3f}"
+        )
         
         return best_candidate
 
