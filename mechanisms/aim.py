@@ -94,12 +94,15 @@ class CLAIM(Mechanism):
             - "outcome": str, outcome variable name  
             - "confounders": list[str], confounder variable names
             - "alpha": float, weight in [0, 1] for this ATE in utility function
+              (this is β_i in claim_algorithm_fwl.tex; the field name is kept
+              as "alpha" for backward compatibility with existing config files)
         causal_graph_path: Path to GML file with causal graph (required for ATE mode).
         ate_sample_size: Samples for final ATE computation (default: 10000).
         sim_sample_size: Samples for simulation during selection (default: 5000).
-        marginal_weight: Weight for L1 marginal error in hybrid selection (default: 0.3).
-            0.0 = pure ATE selection, 1.0 = pure marginal selection.
-            Only used when selection_mode="ate".
+        marginal_weight: λ in claim_algorithm_fwl.tex. Weight for the
+            statistical term L_r in q_r(D) = λ·L_r + (1-λ)·κ·A_r (default: 0.3).
+            0.0 = pure causal (κ·A_r) selection, 1.0 = pure statistical (L_r)
+            selection. Only used when selection_mode="ate".
     """
     
     def __init__(
@@ -378,21 +381,18 @@ class CLAIM(Mechanism):
         self._fwl_kappa = 1.0 / denom
 
     def compute_weighted_ate_error(self, true_ates, model_ates):
-        """Compute weighted sum of ATE errors: Σ α_i * |true_i - model_i|.
-        
-        Args:
-            true_ates: Dict of {name: true_ate_value}.
-            model_ates: Dict of {name: model_ate_value}.
-            
-        Returns:
-            float: Weighted ATE error.
+        """Compute weighted sum of ATE errors: Σ β_i · |τ_i* - τ_i(model)|.
+
+        The per-ATE weight ``config["alpha"]`` corresponds to β_i in
+        claim_algorithm_fwl.tex (kept named "alpha" in code for backward
+        compatibility with existing ATE config files).
         """
         weighted_error = 0.0
         for config in self.ate_configs:
             name = config["name"]
-            alpha = config["alpha"]
+            beta = config["alpha"]
             error = abs(true_ates[name] - model_ates[name])
-            weighted_error += alpha * error
+            weighted_error += beta * error
         return weighted_error
 
     def _model_to_dataframe(self, model, num_samples, seed=None):
