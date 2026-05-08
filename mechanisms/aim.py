@@ -560,9 +560,10 @@ class CLAIM(Mechanism):
             x = answers[cl]
             xest = model.project(cl).datavector()
             n_r = model.domain.size(cl)
-            bias = np.sqrt(2 / np.pi) * sigma * n_r
+            N = x.sum()
+            bias = np.sqrt(2 / np.pi) * sigma * n_r / N
             # Normalize count vectors to probability distributions
-            x_prob = x / x.sum()
+            x_prob = x / N
             xest_prob = xest / xest.sum()
             scores[cl] = np.linalg.norm(x_prob - xest_prob, 1) - bias
         return scores
