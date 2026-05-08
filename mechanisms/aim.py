@@ -538,6 +538,10 @@ class CLAIM(Mechanism):
         Per claim_algorithm_fwl.tex (line:stat-term):
             L_r(D) = ||M_r(D) - M_r(p̂)||_1 - sqrt(2/π) · σ_t · n_r
 
+        M_r(D) and M_r(p̂) are normalized to probability distributions
+        (divided by their respective totals) so that L_r lives on the
+        same O(1) scale as κ·A_r.
+
         Workload weights w_r are intentionally dropped (line:remove-wr); all
         candidates are weighted equally.
 
@@ -557,7 +561,10 @@ class CLAIM(Mechanism):
             xest = model.project(cl).datavector()
             n_r = model.domain.size(cl)
             bias = np.sqrt(2 / np.pi) * sigma * n_r
-            scores[cl] = np.linalg.norm(x - xest, 1) - bias
+            # Normalize count vectors to probability distributions
+            x_prob = x / x.sum()
+            xest_prob = xest / xest.sum()
+            scores[cl] = np.linalg.norm(x_prob - xest_prob, 1) - bias
         return scores
 
     def worst_ate_approximated(
@@ -688,7 +695,7 @@ class CLAIM(Mechanism):
         # has the right shape; calibrating it properly requires either row
         # clipping on τ̂ or a public-bound substitute for the per-cell terms,
         # both deferred per the plan.
-        delta_l = 2.0
+        delta_l = 2.0 / data.records
         delta_a = 1.0
         sensitivity = (
             self.marginal_weight * delta_l
@@ -748,17 +755,19 @@ class CLAIM(Mechanism):
                 alpha = config["alpha"]
                 print(f"  {name} (α={alpha}): {self._true_ates[name]:.6f}")
 
+            # κ is needed by worst_ate_approximated regardless of ate_method,
+            # because _ate_from_model always uses FWL regression from the model.
+            # TODO(DP): v_i and κ are derived from raw D and currently used
+            # without DP accounting. See claim_algorithm_fwl.tex for the κ
+            # role in q_r(D); a public-bound or noised substitute is needed
+            # before the FWL path is fully DP.
+            self._cache_fwl_components(data.df)
             if self.ate_method == "fwl":
-                # TODO(DP): v_i and κ are derived from raw D and currently used
-                # without DP accounting. See claim_algorithm_fwl.tex for the κ
-                # role in q_r(D); a public-bound or noised substitute is needed
-                # before the FWL path is fully DP.
-                self._cache_fwl_components(data.df)
                 print("FWL components:")
                 for config in self.ate_configs:
                     name = config["name"]
                     print(f"  v[{name}] = {self._fwl_v[name]:.6f}")
-                print(f"  κ = {self._fwl_kappa:.6f}")
+            print(f"  κ = {self._fwl_kappa:.6f}")
 
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
