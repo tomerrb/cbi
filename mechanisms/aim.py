@@ -683,7 +683,7 @@ class CLAIM(Mechanism):
             ate_score = ate_scores.get(cl, 0.0)
             combined_scores[cl] = (
                 self.marginal_weight * l1_score
-                + (1 - self.marginal_weight) * kappa * ate_score
+                + 10 * (1 - self.marginal_weight) * kappa * ate_score
             )
 
         # Step 4: Exponential mechanism on q_r(D).
@@ -700,7 +700,7 @@ class CLAIM(Mechanism):
         delta_a = 1.0
         sensitivity = (
             self.marginal_weight * delta_l
-            + (1 - self.marginal_weight) * abs(kappa) * delta_a
+            + 10 * (1 - self.marginal_weight) * abs(kappa) * delta_a
         )
 
         best_candidate = self.exponential_mechanism(
