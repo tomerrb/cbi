@@ -697,7 +697,7 @@ class CLAIM(Mechanism):
         # clipping on τ̂ or a public-bound substitute for the per-cell terms,
         # both deferred per the plan.
         delta_l = 2.0 / data.records
-        delta_a = 1.0
+        delta_a = 2.0 / data.records
         sensitivity = (
             self.marginal_weight * delta_l
             + 10 * (1 - self.marginal_weight) * abs(kappa) * delta_a
