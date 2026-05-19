@@ -677,6 +677,7 @@ class CLAIM(Mechanism):
         #     q_r(D) = λ · L_r(D) + (1 - λ) · κ · A_r(D)
         # κ is cached in self._fwl_kappa from _cache_fwl_components.
         kappa = self._fwl_kappa
+        norm_factor = self.marginal_weight + 10 * (1 - self.marginal_weight)
         combined_scores = {}
         for cl in candidates:
             l1_score = l1_scores.get(cl, 0.0)
@@ -684,7 +685,7 @@ class CLAIM(Mechanism):
             combined_scores[cl] = (
                 self.marginal_weight * l1_score
                 + 10 * (1 - self.marginal_weight) * kappa * ate_score
-            )
+            ) / norm_factor
 
         # Step 4: Exponential mechanism on q_r(D).
         # Sensitivity bound:
@@ -701,7 +702,7 @@ class CLAIM(Mechanism):
         sensitivity = (
             self.marginal_weight * delta_l
             + 10 * (1 - self.marginal_weight) * abs(kappa) * delta_a
-        )
+        ) / norm_factor
 
         best_candidate = self.exponential_mechanism(
             combined_scores, epsilon, sensitivity
