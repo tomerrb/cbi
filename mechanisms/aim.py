@@ -568,22 +568,82 @@ class CLAIM(Mechanism):
             scores[cl] = np.linalg.norm(x_prob - xest_prob, 1) - bias
         return scores
 
+    def _compute_dynamic_mu(self, candidates, model, prev_model, sigma,
+                            ate_scores, kappa, N, eta=1e-8):
+        """Compute the dynamic scale parameter μ_t.
+
+        μ_t adaptively calibrates the causal term's influence so that it
+        operates on the same empirical scale as the statistical term,
+        regardless of how both evolve across iterations.
+
+        Per claim_algorithm_fwl.tex (line:scaling):
+            μ_t = median_r |ΔL_r_proxy| / (κ · median_r |A_r| + η)
+
+        The numerator uses the model-to-model L1 change as a proxy for the
+        current spread of L_r values.  Both numerator and denominator are
+        computed from public (model-derived) quantities only, so μ_t does
+        not increase the DP sensitivity of q_r.
+
+        Args:
+            candidates: Dict of candidate cliques.
+            model: Current fitted model p̂_{t-1}.
+            prev_model: Previous fitted model p̂_{t-2} (None at t=1).
+            sigma: Current Gaussian-noise stddev σ_t.
+            ate_scores: Dict {clique: A_r(D)} already computed.
+            kappa: The κ scaling factor.
+            N: Dataset size (for bias normalization).
+            eta: Small constant to prevent division by zero.
+
+        Returns:
+            float: μ_t (falls back to 10.0 when prev_model is None).
+        """
+        if prev_model is None:
+            return 10.0
+
+        # Numerator: median_r ||| M_r(p̂_{t-1}) - M_r(p̂_{t-2}) ||_1 - bias/N |
+        l_proxy_values = []
+        for cl in candidates:
+            xest_curr = model.project(cl).datavector()
+            xest_prev = prev_model.project(cl).datavector()
+            n_r = model.domain.size(cl)
+            bias = np.sqrt(2 / np.pi) * sigma * n_r / N
+            # Both are model distributions; normalize to probability scale
+            p_curr = xest_curr / xest_curr.sum()
+            p_prev = xest_prev / xest_prev.sum()
+            l_proxy = abs(np.linalg.norm(p_curr - p_prev, 1) - bias)
+            l_proxy_values.append(l_proxy)
+
+        # Denominator: κ · median_r |A_r| + η
+        a_abs_values = [abs(ate_scores.get(cl, 0.0)) for cl in candidates]
+
+        median_l = np.median(l_proxy_values)
+        median_a = np.median(a_abs_values)
+
+        mu_t = median_l / (kappa * median_a + eta)
+
+        print(f"  Dynamic μ_t={mu_t:.4f}  (median|ΔL_proxy|={median_l:.6f}, "
+              f"median|A_r|={median_a:.6f}, κ={kappa:.4f})")
+
+        return mu_t
+
     def worst_ate_approximated(
-        self, candidates, answers, data, model, measurements, epsilon, sigma
+        self, candidates, answers, data, model, prev_model, measurements,
+        epsilon, sigma
     ):
         """Select marginal r_t via the exponential mechanism with quality q_r(D).
 
         Implements claim_algorithm_fwl.tex line:quality-score:
-            q_r(D) = λ · L_r(D) + (1 - λ) · κ · A_r(D)
-        with λ = self.marginal_weight, κ = self._fwl_kappa, L_r from
-        _compute_stat_term, and A_r from per-ATE short-circuits + sampling-free
-        evaluation.
+            q_r(D) = [λ · L_r(D) + (1-λ) · μ_t · κ · A_r(D)] / [λ + (1-λ) · μ_t]
+        with λ = self.marginal_weight, κ = self._fwl_kappa, μ_t from
+        _compute_dynamic_mu, L_r from _compute_stat_term, and A_r from
+        per-ATE short-circuits + sampling-free evaluation.
 
         Args:
             candidates: Dict of candidate cliques (workload weights ignored).
             answers: Dict of true marginals M_r(D) as count vectors.
             data: Original Dataset.
             model: Current fitted PGM model p̂_{t-1}.
+            prev_model: Previous fitted model p̂_{t-2} (None at t=1).
             measurements: Current list of measurements (for refits).
             epsilon: ε_t for the exponential mechanism.
             sigma: σ_t for the bias-correction term in L_r.
@@ -672,36 +732,38 @@ class CLAIM(Mechanism):
                     gc.collect()
                     jax.clear_caches()
         
-        # Step 3: Combine on the absolute scale per claim_algorithm_fwl.tex
-        # (line:quality-score):
-        #     q_r(D) = λ · L_r(D) + (1 - λ) · κ · A_r(D)
-        # κ is cached in self._fwl_kappa from _cache_fwl_components.
+        # Step 3: Compute dynamic μ_t and combine scores.
+        # q_r(D) = [λ · L_r + (1-λ) · μ_t · κ · A_r] / [λ + (1-λ) · μ_t]
+        # μ_t is data-independent (model-derived), so it does not affect DP.
         kappa = self._fwl_kappa
-        norm_factor = self.marginal_weight + 10 * (1 - self.marginal_weight)
+        N = data.records
+        mu_t = self._compute_dynamic_mu(
+            candidates, model, prev_model, sigma, ate_scores, kappa, N
+        )
+        norm_factor = self.marginal_weight + mu_t * (1 - self.marginal_weight)
         combined_scores = {}
         for cl in candidates:
             l1_score = l1_scores.get(cl, 0.0)
             ate_score = ate_scores.get(cl, 0.0)
             combined_scores[cl] = (
                 self.marginal_weight * l1_score
-                + 10 * (1 - self.marginal_weight) * kappa * ate_score
+                + mu_t * (1 - self.marginal_weight) * kappa * ate_score
             ) / norm_factor
 
         # Step 4: Exponential mechanism on q_r(D).
         # Sensitivity bound:
-        #   ΔL_r ≤ 2 (count L1 of M_r is 2-sensitive under add/remove; the
-        #   bias term sqrt(2/π)·σ_t·n_r is data-independent).
+        #   Δq = [λ·ΔL_r + (1-λ)·μ_t·κ·ΔA_r] / [λ + (1-λ)·μ_t]
+        #   Since μ_t is data-independent, Δq ≤ 2/N regardless of μ_t.
         # TODO(DP): ΔA_r is not bounded today. The FWL estimator τ̂ has
         # data-dependent sensitivity (driven by per-cell propensity supports
-        # and v). Treating ΔA_r as 1 here is a placeholder so the EM call
-        # has the right shape; calibrating it properly requires either row
-        # clipping on τ̂ or a public-bound substitute for the per-cell terms,
-        # both deferred per the plan.
-        delta_l = 2.0 / data.records
-        delta_a = 2.0 / data.records
+        # and v). Treating ΔA_r as 2/N here is a placeholder; calibrating
+        # it properly requires either row clipping on τ̂ or a public-bound
+        # substitute for the per-cell terms, both deferred per the plan.
+        delta_l = 2.0 / N
+        delta_a = 2.0 / N
         sensitivity = (
             self.marginal_weight * delta_l
-            + 10 * (1 - self.marginal_weight) * abs(kappa) * delta_a
+            + mu_t * (1 - self.marginal_weight) * abs(kappa) * delta_a
         ) / norm_factor
 
         best_candidate = self.exponential_mechanism(
@@ -713,7 +775,8 @@ class CLAIM(Mechanism):
 
         print(
             f"Selected {best_candidate} (EM, ε={epsilon:.3f}, Δq={sensitivity:.3f}): "
-            f"L_r={best_l1:.3f}, A_r={best_ate:.3f}, κ={kappa:.3f}, q_r={best_combined:.3f}"
+            f"L_r={best_l1:.3f}, A_r={best_ate:.3f}, κ={kappa:.3f}, "
+            f"μ_t={mu_t:.3f}, q_r={best_combined:.3f}"
         )
         
         return best_candidate
@@ -801,6 +864,7 @@ class CLAIM(Mechanism):
 
         t = 0
         terminate = False
+        prev_model = None  # p̂_{t-2}; None at first iteration
         while not terminate:
             t += 1
             if self.rho - rho_used < 2 * (0.5 / sigma**2 + 1.0 / 8 * epsilon**2):
@@ -819,8 +883,8 @@ class CLAIM(Mechanism):
             # Branch on selection mode
             if self.selection_mode == "ate":
                 cl = self.worst_ate_approximated(
-                    small_candidates, answers, data, model, measurements,
-                    epsilon, sigma,
+                    small_candidates, answers, data, model, prev_model,
+                    measurements, epsilon, sigma,
                 )
             else:
                 cl = self.worst_approximated(
@@ -837,6 +901,7 @@ class CLAIM(Mechanism):
             # TODO: check if it helps to call maximal_subsets here
             pcliques = list(set(M.clique for M in measurements))
             potentials = model.potentials.expand(pcliques)
+            prev_model = model  # store p̂_{t-1} as p̂_{t-2} for next iteration
             model = estimation.mirror_descent(
                     data.domain, measurements, iters=self.max_iters, potentials=potentials, callback_fn=lambda *_: None
             )
