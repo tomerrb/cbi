@@ -256,9 +256,9 @@ def main():
     preprocessor = AdultPreprocessor()
     df_encoded = preprocessor.fit_transform(df)
 
-    # If using FWL backend, attach per-config bounds derived from the encoded domain.
-    # Treatment and outcome are binarized -> [0, 1]; confounders span [0, cardinality - 1].
-    if args.selection_mode == 'ate' and args.ate_method == 'fwl':
+    # _ate_from_model always uses FWL regression internally to estimate ATE from the
+    # synthetic model, so bounds are required for both 'fwl' and 'dowhy' ate_method.
+    if args.selection_mode == 'ate':
         for config in ate_configs:
             bounds = {
                 config['treatment']: [0, 1],
@@ -267,11 +267,11 @@ def main():
             for c in config['confounders']:
                 if c not in preprocessor.domain_config:
                     raise ValueError(
-                        f"Confounder '{c}' not found in encoded domain; cannot derive FWL bounds"
+                        f"Confounder '{c}' not found in encoded domain; cannot derive bounds"
                     )
                 bounds[c] = [0, preprocessor.domain_config[c] - 1]
             config['bounds'] = bounds
-        print("  Injected FWL bounds into ATE configs")
+        print("  Injected bounds into ATE configs")
     
     # Save domain
     domain_path = os.path.join(args.output_dir, 'domain.json')

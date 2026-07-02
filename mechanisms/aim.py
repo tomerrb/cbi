@@ -241,15 +241,18 @@ class CLAIM(Mechanism):
                 positive_value = bin_config.get("positive_value", 1)
                 df[treatment] = (df[treatment] == positive_value).astype(int)
             elif bin_config.get("type") == "categorical":
-                # For categorical type: use encoded_positive_value for encoded data
-                encoded_positive_value = bin_config.get("encoded_positive_value")
-                if encoded_positive_value is not None:
-                    df[treatment] = (df[treatment] == encoded_positive_value).astype(int)
+                # For categorical type: support list (encoded_positive_values) or single value
+                encoded_positive_values = bin_config.get("encoded_positive_values")
+                if encoded_positive_values is not None:
+                    df[treatment] = df[treatment].isin(encoded_positive_values).astype(int)
                 else:
-                    # Fallback to positive_value if encoded_positive_value not specified
-                    positive_value = bin_config.get("positive_value", 1)
-                    df[treatment] = (df[treatment] == positive_value).astype(int)
-        
+                    encoded_positive_value = bin_config.get("encoded_positive_value")
+                    if encoded_positive_value is not None:
+                        df[treatment] = (df[treatment] == encoded_positive_value).astype(int)
+                    else:
+                        positive_value = bin_config.get("positive_value", 1)
+                        df[treatment] = (df[treatment] == positive_value).astype(int)
+
         # Binarize outcome if config provided
         if "outcome" in binarization:
             bin_config = binarization["outcome"]
