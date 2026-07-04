@@ -1,11 +1,14 @@
 """Implementation of CLAIM: Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data.
 
-This implementation supports two selection modes:
+This implementation supports three selection modes:
 - "marginal" (default): Original L1-based selection using the exponential mechanism.
   Selects the worst-approximated marginal based on L1 distance.
 - "ate": ATE-based selection for causal inference applications.
   Selects the marginal that most improves Average Treatment Effect estimation.
   Requires DoWhy library and causal structure specification.
+- "claim": Blended CLAIM selection.  Selects marginals with an exponential
+  mechanism using a convex tradeoff between marginal error and predicted ATE
+  improvement.  The tradeoff is controlled by lambda_weight.
 
 Note that with the default settings, CLAIM can take many hours to run. You can configure
 the runtime/utility tradeoff via the max_model_size flag. We recommend setting it to 1.0
@@ -31,6 +34,8 @@ from scipy.optimize import bisect
 import pandas as pd
 from mbi import Factor
 import argparse
+from cdp2adp import cdp_rho, cdp_eps
+import warnings
 
 
 def powerset(iterable):
@@ -76,7 +81,7 @@ def filter_candidates(candidates, model, size_limit):
 
 class CLAIM(Mechanism):
     """Causally-Learned Adaptive and Iterative Mechanism for DP Synthetic Data.
-    
+
     Args:
         epsilon: Privacy parameter (epsilon for zCDP conversion).
         delta: Privacy parameter.
@@ -85,15 +90,22 @@ class CLAIM(Mechanism):
         max_model_size: Maximum model size in MB (default: 80).
         max_iters: Maximum iterations for mirror descent (default: 1000).
         structural_zeros: Dict of structural zeros constraints.
-        selection_mode: "marginal" (L1-based) or "ate" (ATE-based) selection.
-        treatment: Treatment variable name (required for ATE mode).
+        selection_mode: "marginal" (L1-based), "ate" (ATE-based), or
+            "claim" (blended marginal/ATE) selection.
+        lambda_weight: Weight on the marginal/statistical term. Smaller values
+            give more weight to the causal/ATE term.
+        mu: Scale multiplier for the causal term in blended CLAIM selection.
+        kappa: Optional normalizer for the causal term.
+        lambda_schedule: "fixed" or "adaptive". If adaptive, lambda_weight is
+            adjusted each round using current model ATE error.
+        treatment: Treatment variable name (required for ATE/CLAIM modes).
         outcome: Outcome variable name (required for ATE mode).
         confounders: List of confounder variable names (required for ATE mode).
         causal_graph_path: Path to GML file with causal graph (required for ATE mode).
         ate_sample_size: Samples for final ATE computation (default: 10000).
         sim_sample_size: Samples for simulation during selection (default: 5000).
     """
-    
+
     def __init__(
         self,
         epsilon,
@@ -104,6 +116,15 @@ class CLAIM(Mechanism):
         max_iters=1000,
         structural_zeros={},
         selection_mode="marginal",
+        lambda_weight=0.5,
+        mu=1.0,
+        kappa=1.0,
+        lambda_schedule="fixed",
+        lambda_min=0.1,
+        lambda_max=0.9,
+        lambda_update_factor=1.25,
+        ate_tolerance=None,
+        reference_ate=None,
         treatment=None,
         outcome=None,
         confounders=None,
@@ -111,17 +132,40 @@ class CLAIM(Mechanism):
         ate_sample_size=10000,
         sim_sample_size=5000,
     ):
-        super(CLAIM, self).__init__(epsilon, delta, prng)
+        super(CLAIM, self).__init__(epsilon, delta, bounded=False, prng=prng or np.random)
         self.rounds = rounds
         self.max_iters = max_iters
         self.max_model_size = max_model_size
         self.structural_zeros = structural_zeros
-        
+
         # Selection mode configuration
         self.selection_mode = selection_mode
-        if selection_mode not in ("marginal", "ate"):
-            raise ValueError(f"selection_mode must be 'marginal' or 'ate', got '{selection_mode}'")
-        
+        if selection_mode not in ("marginal", "ate", "claim"):
+            raise ValueError(
+                "selection_mode must be 'marginal', 'ate', or 'claim', "
+                f"got '{selection_mode}'"
+            )
+
+        # CLAIM lambda configuration
+        self.lambda_weight = float(lambda_weight)
+        self.mu = float(mu)
+        self.kappa = float(kappa)
+        self.lambda_schedule = lambda_schedule
+        self.lambda_min = float(lambda_min)
+        self.lambda_max = float(lambda_max)
+        self.lambda_update_factor = float(lambda_update_factor)
+        self.ate_tolerance = ate_tolerance
+        if self.lambda_schedule not in ("fixed", "adaptive"):
+            raise ValueError("lambda_schedule must be 'fixed' or 'adaptive'")
+        if not (0.0 <= self.lambda_weight <= 1.0):
+            raise ValueError("lambda_weight must be in [0, 1]")
+        if not (0.0 <= self.lambda_min <= self.lambda_max <= 1.0):
+            raise ValueError("lambda_min/lambda_max must satisfy 0 <= min <= max <= 1")
+        if self.lambda_schedule == "adaptive" and self.lambda_min <= 0:
+            raise ValueError("adaptive lambda requires lambda_min > 0")
+        if self.lambda_update_factor <= 1.0:
+            raise ValueError("lambda_update_factor must be > 1")
+
         # ATE mode configuration
         self.treatment = treatment
         self.outcome = outcome
@@ -129,13 +173,14 @@ class CLAIM(Mechanism):
         self.ate_sample_size = ate_sample_size
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
-        self._true_ate = None
-        
-        if selection_mode == "ate":
+        self._true_ate = reference_ate
+        self.reference_ate = reference_ate
+
+        if selection_mode in ("ate", "claim"):
             # Validate required causal parameters
             if not all([treatment, outcome, confounders, causal_graph_path]):
                 raise ValueError(
-                    "ATE mode requires treatment, outcome, confounders, and causal_graph_path"
+                    "ATE/CLAIM mode requires treatment, outcome, confounders, and causal_graph_path"
                 )
             # Load GML causal graph
             with open(causal_graph_path, 'r') as f:
@@ -143,39 +188,39 @@ class CLAIM(Mechanism):
 
     def compute_ate_from_data(self, df):
         """Compute ATE using DoWhy's backdoor adjustment.
-        
+
         Args:
             df: DataFrame containing treatment, outcome, and confounder columns.
-            
+
         Returns:
             float: Estimated ATE value.
         """
         # Late import to avoid dependency when not using ATE mode
         from dowhy import CausalModel
-        
+
         model = CausalModel(
             data=df,
             treatment=self.treatment,
             outcome=self.outcome,
             graph=self.causal_graph
         )
-        
+
         identified_estimand = model.identify_effect(proceed_when_unidentifiable=True)
         estimate = model.estimate_effect(
             identified_estimand,
             method_name="backdoor.linear_regression"
         )
-        
+
         return estimate.value
 
     def _model_to_dataframe(self, model, num_samples, seed=None):
         """Generate synthetic DataFrame from PGM model with optional seed for reproducibility.
-        
+
         Args:
             model: Fitted PGM model.
             num_samples: Number of samples to generate.
             seed: Optional random seed for reproducibility.
-            
+
         Returns:
             DataFrame: Synthetic data.
         """
@@ -186,53 +231,53 @@ class CLAIM(Mechanism):
 
     def _simulate_measurement(self, model, data, clique, measurements):
         """Simulate measuring a clique without actually adding noise.
-        
+
         Returns a new model fitted with the additional measurement.
         Used to predict how measuring a particular clique would affect ATE.
-        
+
         Args:
             model: Current fitted PGM model.
             data: Original Dataset.
             clique: Clique to simulate measuring.
             measurements: Current list of measurements.
-            
+
         Returns:
             Model: New model fitted with the simulated measurement.
         """
         # Get true marginal (no noise since we're simulating)
         x = data.project(clique).datavector()
-        
+
         # Small stddev = high confidence measurement
         temp_measurement = LinearMeasurement(x, clique, stddev=1e-10)
-        
+
         # Copy and extend measurements
         sim_measurements = measurements.copy()
         sim_measurements.append(temp_measurement)
-        
+
         # Warm start from current model
         pcliques = list(set(M.clique for M in sim_measurements))
         potentials = model.potentials.expand(pcliques)
-        
+
         # Fit with fewer iterations for speed during simulation
         sim_model = estimation.mirror_descent(
-            data.domain, 
-            sim_measurements, 
+            data.domain,
+            sim_measurements,
             iters=min(self.max_iters, 500),
             potentials=potentials,
             callback_fn=lambda *_: None
         )
-        
+
         return sim_model
 
     def _fallback_worst_approximated(self, candidates, answers, model, sigma):
         """Original L1-based selection as fallback (deterministic, no exponential mechanism).
-        
+
         Args:
             candidates: Dict of candidate cliques with weights.
             answers: Dict of true marginals.
             model: Current fitted model.
             sigma: Noise standard deviation.
-            
+
         Returns:
             tuple: Selected clique.
         """
@@ -242,17 +287,17 @@ class CLAIM(Mechanism):
             x = answers[cl]
             xest = model.project(cl).datavector()
             errors[cl] = wgt * np.linalg.norm(x - xest, 1)
-        
+
         # Deterministic: pick max error
         return max(errors, key=errors.get)
 
     def worst_ate_approximated(self, candidates, answers, data, model, measurements, sigma):
         """Select the marginal that most improves ATE estimation.
-        
+
         Iterates over candidates, simulates measuring each one, and selects
         the one that minimizes ATE error. Falls back to L1 selection if no
         candidate improves ATE.
-        
+
         Args:
             candidates: Dict of candidate cliques with weights.
             answers: Dict of true marginals.
@@ -260,33 +305,33 @@ class CLAIM(Mechanism):
             model: Current fitted model.
             measurements: Current list of measurements.
             sigma: Noise standard deviation.
-            
+
         Returns:
             tuple: Selected clique.
         """
         # Use cached true ATE
         true_ate = self._true_ate
-        
+
         # Current model's ATE (use fixed seed for consistency)
         current_model_df = self._model_to_dataframe(model, self.sim_sample_size, seed=42)
         current_ate = self.compute_ate_from_data(current_model_df)
         current_error = abs(true_ate - current_ate)
-        
+
         print(f"Current ATE error: {current_error:.6f} (true={true_ate:.4f}, model={current_ate:.4f})")
-        
+
         best_candidate = None
         best_error = current_error
-        
+
         for cl in candidates:
             try:
                 # Simulate measuring this clique
                 simulated_model = self._simulate_measurement(model, data, cl, measurements)
-                
+
                 # Compute ATE with fixed seed
                 simulated_df = self._model_to_dataframe(simulated_model, self.sim_sample_size, seed=42)
                 simulated_ate = self.compute_ate_from_data(simulated_df)
                 simulated_error = abs(true_ate - simulated_ate)
-                
+
                 if simulated_error < best_error:
                     best_error = simulated_error
                     best_candidate = cl
@@ -294,24 +339,24 @@ class CLAIM(Mechanism):
             except Exception as e:
                 print(f"  Candidate {cl}: failed ({e})")
                 continue
-        
+
         # Fallback: use original L1-based selection if no ATE improvement
         if best_candidate is None:
             print("No ATE improvement found, falling back to L1 selection")
             best_candidate = self._fallback_worst_approximated(candidates, answers, model, sigma)
-        
+
         return best_candidate
 
     def worst_approximated(self, candidates, answers, model, eps, sigma):
         """Original L1-based selection using the exponential mechanism.
-        
+
         Args:
             candidates: Dict of candidate cliques with weights.
             answers: Dict of true marginals.
             model: Current fitted model.
             eps: Epsilon for exponential mechanism.
             sigma: Noise standard deviation.
-            
+
         Returns:
             tuple: Selected clique.
         """
@@ -330,12 +375,117 @@ class CLAIM(Mechanism):
         )  # if all weights are 0, could be a problem
         return self.exponential_mechanism(errors, eps, max_sensitivity)
 
+
+    def _ate_error_for_model(self, model, seed=42):
+        """Compute absolute ATE error for the current PGM model."""
+        if self._true_ate is None:
+            raise ValueError("A reference/true ATE is required for ATE error computation")
+        df = self._model_to_dataframe(model, self.sim_sample_size, seed=seed)
+        ate = self.compute_ate_from_data(df)
+        return abs(self._true_ate - ate), ate
+
+    def _maybe_update_lambda(self, model):
+        """Update lambda_weight using current model ATE error.
+
+        Smaller lambda means more causal weight.  If the current model does not
+        preserve ATE well enough, decrease lambda.  If the current model is good
+        enough, increase lambda to give more weight to statistical fidelity.
+        """
+        if self.lambda_schedule != "adaptive" or self.selection_mode != "claim":
+            return
+        if self.ate_tolerance is None:
+            raise ValueError("adaptive lambda requires ate_tolerance")
+
+        current_error, current_ate = self._ate_error_for_model(model, seed=42)
+        old_lambda = self.lambda_weight
+        if current_error > self.ate_tolerance:
+            self.lambda_weight = max(
+                self.lambda_min, self.lambda_weight / self.lambda_update_factor
+            )
+        else:
+            self.lambda_weight = min(
+                self.lambda_max, self.lambda_weight * self.lambda_update_factor
+            )
+        print(
+            "Adaptive lambda: "
+            f"ATE error={current_error:.6f}, model ATE={current_ate:.6f}, "
+            f"lambda {old_lambda:.4f} -> {self.lambda_weight:.4f}"
+        )
+
+    def _claim_candidate_scores(self, candidates, answers, data, model, measurements, sigma):
+        """Compute blended CLAIM scores for candidate cliques.
+
+        The statistical term is AIM's L1 marginal error minus expected Gaussian
+        noise bias.  The causal term is the predicted ATE-error improvement from
+        simulating that candidate measurement.  Higher is better.
+        """
+        if self._true_ate is None:
+            raise ValueError("CLAIM mode requires a reference ATE")
+
+        current_error, current_ate = self._ate_error_for_model(model, seed=42)
+        print(
+            f"Current ATE error: {current_error:.6f} "
+            f"(reference={self._true_ate:.4f}, model={current_ate:.4f})"
+        )
+
+        scores = {}
+        stat_scores = {}
+        causal_scores = {}
+        lam = self.lambda_weight
+        denom = lam + (1.0 - lam) * self.mu
+
+        for cl in candidates:
+            wgt = candidates[cl]
+            x = answers[cl]
+            xest = model.project(cl).datavector()
+            bias = np.sqrt(2 / np.pi) * sigma * model.domain.size(cl)
+            stat = wgt * (np.linalg.norm(x - xest, 1) - bias)
+            stat_scores[cl] = stat
+
+            causal = 0.0
+            try:
+                simulated_model = self._simulate_measurement(model, data, cl, measurements)
+                simulated_error, simulated_ate = self._ate_error_for_model(simulated_model, seed=42)
+                causal = current_error - simulated_error
+                if causal > 0:
+                    print(
+                        f"  Candidate {cl}: ATE error={simulated_error:.6f}, "
+                        f"improvement={causal:.6f}"
+                    )
+            except Exception as exc:
+                print(f"  Candidate {cl}: ATE simulation failed ({exc})")
+            causal_scores[cl] = causal
+            scores[cl] = (lam * stat + (1.0 - lam) * self.mu * self.kappa * causal) / denom
+
+        return scores, stat_scores, causal_scores
+
+    def claim_approximated(self, candidates, answers, data, model, measurements, eps, sigma):
+        """Blended CLAIM selection with the exponential mechanism."""
+        scores, _, _ = self._claim_candidate_scores(
+            candidates, answers, data, model, measurements, sigma
+        )
+        # This follows the same practical sensitivity scale as AIM's weighted
+        # marginal score.  If the causal/reference ATE is computed directly from
+        # private data, a formal proof must also bound that contribution.
+        sensitivity = max(abs(wgt) for wgt in candidates.values())
+        sensitivity = max(sensitivity, 1e-12)
+        return self.exponential_mechanism(scores, eps, sensitivity)
+
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
-        # Cache true ATE at the start if using ATE mode
-        if self.selection_mode == "ate":
-            self._true_ate = self.compute_ate_from_data(data.df)
-            print(f"True ATE from data: {self._true_ate:.6f}")
-        
+        # Cache reference ATE at the start if using ATE/CLAIM mode.  For formal
+        # privacy, pass a privately released reference_ate.  If reference_ate is
+        # omitted, this computes the estimator on the sensitive data and should
+        # be used only for experiments/debugging.
+        if self.selection_mode in ("ate", "claim"):
+            if self._true_ate is None:
+                warnings.warn(
+                    "Computing reference ATE directly from private data. "
+                    "For a formal privacy guarantee, pass a DP reference_ate.",
+                    RuntimeWarning,
+                )
+                self._true_ate = self.compute_ate_from_data(data.df)
+            print(f"Reference ATE: {self._true_ate:.6f}")
+
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
         answers = {cl: data.project(cl).datavector() for cl in candidates}
@@ -380,11 +530,20 @@ class CLAIM(Mechanism):
             size_limit = self.max_model_size * rho_used / self.rho
 
             small_candidates = filter_candidates(candidates, model, size_limit)
-            
+
+            # Optional one-run adaptive lambda update.  Decreasing lambda gives
+            # more weight to the causal term; increasing lambda gives more
+            # weight to the statistical/marginal term.
+            self._maybe_update_lambda(model)
+
             # Branch on selection mode
             if self.selection_mode == "ate":
                 cl = self.worst_ate_approximated(
                     small_candidates, answers, data, model, measurements, sigma
+                )
+            elif self.selection_mode == "claim":
+                cl = self.claim_approximated(
+                    small_candidates, answers, data, model, measurements, epsilon, sigma
                 )
             else:
                 cl = self.worst_approximated(
@@ -420,6 +579,97 @@ class CLAIM(Mechanism):
         return model, synth
 
 
+
+def _epsilon_for_rho(rho, delta):
+    """Return an epsilon whose cdp_rho(epsilon, delta) is approximately rho."""
+    if rho <= 0:
+        return 0.0
+    return cdp_eps(rho, delta)
+
+
+def pilot_select_lambda(
+    data,
+    workload,
+    epsilon,
+    delta,
+    lambda_values=(0.1, 0.5, 0.9),
+    pilot_fraction=0.15,
+    pilot_samples=5,
+    num_synth_rows=None,
+    **claim_kwargs,
+):
+    """Select lambda with cheap pilot CLAIM runs, then run the final CLAIM.
+
+    The procedure spends a small zCDP budget on one pilot run per lambda, scores
+    each pilot model by average synthetic ATE error, and then spends the remaining
+    budget on a final run with the selected lambda.
+
+    If `reference_ate` is supplied in `claim_kwargs`, scoring is post-processing
+    of DP outputs.  If it is omitted, the reference ATE is computed from the raw
+    data for experimental use only and should not be claimed as private without
+    additional accounting.
+    """
+    if not lambda_values:
+        raise ValueError("lambda_values must contain at least one value")
+    if not (0.0 < pilot_fraction < 1.0):
+        raise ValueError("pilot_fraction must be in (0, 1)")
+
+    total_rho = cdp_rho(epsilon, delta)
+    pilot_rho_each = total_rho * pilot_fraction / len(lambda_values)
+    final_rho = total_rho * (1.0 - pilot_fraction)
+    pilot_epsilon = _epsilon_for_rho(pilot_rho_each, delta)
+    final_epsilon = _epsilon_for_rho(final_rho, delta)
+
+    reference_ate = claim_kwargs.get("reference_ate")
+    if reference_ate is None:
+        tmp = CLAIM(epsilon, delta, **claim_kwargs)
+        warnings.warn(
+            "Computing pilot reference ATE directly from private data. "
+            "For a formal privacy guarantee, pass a DP reference_ate.",
+            RuntimeWarning,
+        )
+        reference_ate = tmp.compute_ate_from_data(data.df)
+        claim_kwargs["reference_ate"] = reference_ate
+
+    scores = {}
+    pilot_outputs = {}
+    for lam in lambda_values:
+        print(f"\n[Pilot lambda={lam}] budget rho={pilot_rho_each:.6g}")
+        mech = CLAIM(
+            pilot_epsilon,
+            delta,
+            lambda_weight=lam,
+            lambda_schedule="fixed",
+            **claim_kwargs,
+        )
+        model, synth = mech.run(data, workload, num_synth_rows=num_synth_rows)
+        errors = []
+        for b in range(pilot_samples):
+            rows = num_synth_rows or data.records
+            pilot_df = model.synthetic_data(rows=rows).df
+            pilot_ate = mech.compute_ate_from_data(pilot_df)
+            errors.append(abs(reference_ate - pilot_ate))
+        avg_error = float(np.mean(errors))
+        scores[lam] = avg_error
+        pilot_outputs[lam] = (model, synth)
+        print(f"[Pilot lambda={lam}] average ATE error={avg_error:.6f}")
+
+    selected_lambda = min(scores, key=scores.get)
+    print(f"\nSelected lambda={selected_lambda} with pilot ATE error={scores[selected_lambda]:.6f}")
+    print(f"[Final lambda={selected_lambda}] budget rho={final_rho:.6g}")
+
+    final_mech = CLAIM(
+        final_epsilon,
+        delta,
+        lambda_weight=selected_lambda,
+        lambda_schedule="fixed",
+        **claim_kwargs,
+    )
+    final_model, final_synth = final_mech.run(
+        data, workload, num_synth_rows=num_synth_rows
+    )
+    return selected_lambda, scores, final_model, final_synth
+
 def default_params():
     """
     Return default parameters to run this program
@@ -437,8 +687,21 @@ def default_params():
     params["degree"] = 2
     params["num_marginals"] = None
     params["max_cells"] = 10000
-    # Selection mode: "marginal" (L1-based) or "ate" (ATE-based)
+    # Selection mode: "marginal", "ate", or "claim"
     params["selection_mode"] = "marginal"
+    params["lambda_weight"] = 0.5
+    params["mu"] = 1.0
+    params["kappa"] = 1.0
+    params["lambda_schedule"] = "fixed"
+    params["lambda_min"] = 0.1
+    params["lambda_max"] = 0.9
+    params["lambda_update_factor"] = 1.25
+    params["ate_tolerance"] = None
+    params["reference_ate"] = None
+    params["pilot_lambda"] = False
+    params["lambda_values"] = "0.1,0.5,0.9"
+    params["pilot_fraction"] = 0.15
+    params["pilot_samples"] = 5
     # Causal parameters (required when selection_mode="ate")
     params["treatment"] = None
     params["outcome"] = None
@@ -471,15 +734,65 @@ if __name__ == "__main__":
         help="maximum number of cells for marginals in workload",
     )
     parser.add_argument("--save", type=str, help="path to save synthetic data")
-    
+
     # Selection mode arguments
     parser.add_argument(
         "--selection_mode",
         type=str,
-        choices=["marginal", "ate"],
-        help="Selection mode: 'marginal' (L1-based) or 'ate' (ATE-based)"
+        choices=["marginal", "ate", "claim"],
+        help="Selection mode: 'marginal' (L1-based), 'ate' (ATE-based), or 'claim' (blended)"
     )
-    
+
+    parser.add_argument(
+        "--lambda_weight",
+        type=float,
+        help="Weight on marginal/statistical term; smaller gives more causal weight"
+    )
+    parser.add_argument("--mu", type=float, help="Scale multiplier for causal term")
+    parser.add_argument("--kappa", type=float, help="Normalizer for causal term")
+    parser.add_argument(
+        "--lambda_schedule",
+        choices=["fixed", "adaptive"],
+        help="Use fixed lambda or adapt lambda during one CLAIM run"
+    )
+    parser.add_argument("--lambda_min", type=float, help="Minimum adaptive lambda")
+    parser.add_argument("--lambda_max", type=float, help="Maximum adaptive lambda")
+    parser.add_argument(
+        "--lambda_update_factor",
+        type=float,
+        help="Multiplicative adaptive lambda update factor"
+    )
+    parser.add_argument(
+        "--ate_tolerance",
+        type=float,
+        help="ATE-error tolerance for adaptive lambda; required when lambda_schedule=adaptive"
+    )
+    parser.add_argument(
+        "--reference_ate",
+        type=float,
+        help="Privately released/reference ATE. If omitted in ATE/CLAIM mode, raw-data ATE is computed for experiments only."
+    )
+    parser.add_argument(
+        "--pilot_lambda",
+        action="store_true",
+        help="Run pilot lambda selection over --lambda_values before the final run"
+    )
+    parser.add_argument(
+        "--lambda_values",
+        type=str,
+        help="Comma-separated lambda grid for pilot selection, e.g. 0.1,0.5,0.9"
+    )
+    parser.add_argument(
+        "--pilot_fraction",
+        type=float,
+        help="Fraction of zCDP budget spent on all pilot lambda runs"
+    )
+    parser.add_argument(
+        "--pilot_samples",
+        type=int,
+        help="Number of synthetic samples used to average pilot ATE error"
+    )
+
     # Causal structure arguments (required when selection_mode="ate")
     parser.add_argument(
         "--treatment",
@@ -504,7 +817,7 @@ if __name__ == "__main__":
 
     parser.set_defaults(**default_params())
     args = parser.parse_args()
-    
+
     # Parse confounders from comma-separated string if provided
     confounders_list = None
     if args.confounders is not None:
@@ -522,9 +835,8 @@ if __name__ == "__main__":
         ]
 
     workload = [(cl, 1.0) for cl in workload]
-    mech = CLAIM(
-        args.epsilon,
-        args.delta,
+
+    claim_kwargs = dict(
         max_model_size=args.max_model_size,
         max_iters=args.max_iters,
         selection_mode=args.selection_mode,
@@ -532,17 +844,54 @@ if __name__ == "__main__":
         outcome=args.outcome,
         confounders=confounders_list,
         causal_graph_path=args.causal_graph,
+        lambda_weight=args.lambda_weight,
+        mu=args.mu,
+        kappa=args.kappa,
+        lambda_schedule=args.lambda_schedule,
+        lambda_min=args.lambda_min,
+        lambda_max=args.lambda_max,
+        lambda_update_factor=args.lambda_update_factor,
+        ate_tolerance=args.ate_tolerance,
+        reference_ate=args.reference_ate,
     )
-    model, synth = mech.run(data, workload)
+
+    selected_lambda = None
+    lambda_scores = None
+    if args.pilot_lambda:
+        lambda_values = [float(x.strip()) for x in args.lambda_values.split(',') if x.strip()]
+        selected_lambda, lambda_scores, model, synth = pilot_select_lambda(
+            data,
+            workload,
+            args.epsilon,
+            args.delta,
+            lambda_values=lambda_values,
+            pilot_fraction=args.pilot_fraction,
+            pilot_samples=args.pilot_samples,
+            **claim_kwargs,
+        )
+        mech = CLAIM(
+            args.epsilon,
+            args.delta,
+            **{**claim_kwargs, "lambda_weight": selected_lambda, "lambda_schedule": "fixed"},
+        )
+    else:
+        mech = CLAIM(args.epsilon, args.delta, **claim_kwargs)
+        model, synth = mech.run(data, workload)
 
     if args.save is not None:
         synth.df.to_csv(args.save, index=False)
 
-    # Print ATE comparison if in ATE mode
-    if args.selection_mode == "ate":
-        true_ate = mech._true_ate
+    if selected_lambda is not None:
+        print(f"Selected Lambda: {selected_lambda}")
+        print(f"Pilot Lambda Scores: {lambda_scores}")
+
+    # Print ATE comparison if in ATE/CLAIM mode
+    if args.selection_mode in ("ate", "claim"):
+        true_ate = mech._true_ate or args.reference_ate
+        if true_ate is None:
+            true_ate = mech.compute_ate_from_data(data.df)
         synth_ate = mech.compute_ate_from_data(synth.df)
-        print(f"True ATE: {true_ate:.6f}")
+        print(f"Reference ATE: {true_ate:.6f}")
         print(f"Synthetic ATE: {synth_ate:.6f}")
         print(f"ATE Error: {abs(true_ate - synth_ate):.6f}")
 
