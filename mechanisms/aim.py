@@ -96,8 +96,8 @@ class CLAIM(Mechanism):
             give more weight to the causal/ATE term.
         mu: Scale multiplier for the causal term in blended CLAIM selection.
         kappa: Optional normalizer for the causal term.
-        lambda_schedule: "fixed" or "adaptive". If adaptive, lambda_weight is
-            adjusted each round using current model ATE error.
+        adaptive_lambda: If True, lambda_weight is adjusted at the end of each round
+            using current model ATE error.
         treatment: Treatment variable name (required for ATE/CLAIM modes).
         outcome: Outcome variable name (required for ATE mode).
         confounders: List of confounder variable names (required for ATE mode).
@@ -119,11 +119,11 @@ class CLAIM(Mechanism):
         lambda_weight=0.5,
         mu=1.0,
         kappa=1.0,
-        lambda_schedule="fixed",
+        adaptive_lambda=False,
         lambda_min=0.1,
         lambda_max=0.9,
         lambda_update_factor=1.25,
-        ate_tolerance=None,
+        ate_tolerance=0.01,
         reference_ate=None,
         treatment=None,
         outcome=None,
@@ -150,18 +150,17 @@ class CLAIM(Mechanism):
         self.lambda_weight = float(lambda_weight)
         self.mu = float(mu)
         self.kappa = float(kappa)
-        self.lambda_schedule = lambda_schedule
+        self.adaptive_lambda = bool(adaptive_lambda)
+        self.lambda_schedule = "adaptive" if self.adaptive_lambda else "fixed"
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
         self.lambda_update_factor = float(lambda_update_factor)
         self.ate_tolerance = ate_tolerance
-        if self.lambda_schedule not in ("fixed", "adaptive"):
-            raise ValueError("lambda_schedule must be 'fixed' or 'adaptive'")
         if not (0.0 <= self.lambda_weight <= 1.0):
             raise ValueError("lambda_weight must be in [0, 1]")
         if not (0.0 <= self.lambda_min <= self.lambda_max <= 1.0):
             raise ValueError("lambda_min/lambda_max must satisfy 0 <= min <= max <= 1")
-        if self.lambda_schedule == "adaptive" and self.lambda_min <= 0:
+        if self.adaptive_lambda and self.lambda_min <= 0:
             raise ValueError("adaptive lambda requires lambda_min > 0")
         if self.lambda_update_factor <= 1.0:
             raise ValueError("lambda_update_factor must be > 1")
@@ -173,7 +172,6 @@ class CLAIM(Mechanism):
         self.ate_sample_size = ate_sample_size
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
-        self._true_ate = reference_ate
         self.reference_ate = reference_ate
 
         if selection_mode in ("ate", "claim"):
@@ -310,7 +308,7 @@ class CLAIM(Mechanism):
             tuple: Selected clique.
         """
         # Use cached true ATE
-        true_ate = self._true_ate
+        true_ate = self.reference_ate
 
         # Current model's ATE (use fixed seed for consistency)
         current_model_df = self._model_to_dataframe(model, self.sim_sample_size, seed=42)
@@ -378,11 +376,11 @@ class CLAIM(Mechanism):
 
     def _ate_error_for_model(self, model, seed=42):
         """Compute absolute ATE error for the current PGM model."""
-        if self._true_ate is None:
+        if self.reference_ate is None:
             raise ValueError("A reference/true ATE is required for ATE error computation")
         df = self._model_to_dataframe(model, self.sim_sample_size, seed=seed)
         ate = self.compute_ate_from_data(df)
-        return abs(self._true_ate - ate), ate
+        return abs(self.reference_ate - ate), ate
 
     def _maybe_update_lambda(self, model):
         """Update lambda_weight using current model ATE error.
@@ -391,7 +389,7 @@ class CLAIM(Mechanism):
         preserve ATE well enough, decrease lambda.  If the current model is good
         enough, increase lambda to give more weight to statistical fidelity.
         """
-        if self.lambda_schedule != "adaptive" or self.selection_mode != "claim":
+        if not self.adaptive_lambda or self.selection_mode != "claim":
             return
         if self.ate_tolerance is None:
             raise ValueError("adaptive lambda requires ate_tolerance")
@@ -419,13 +417,13 @@ class CLAIM(Mechanism):
         noise bias.  The causal term is the predicted ATE-error improvement from
         simulating that candidate measurement.  Higher is better.
         """
-        if self._true_ate is None:
+        if self.reference_ate is None:
             raise ValueError("CLAIM mode requires a reference ATE")
 
         current_error, current_ate = self._ate_error_for_model(model, seed=42)
         print(
             f"Current ATE error: {current_error:.6f} "
-            f"(reference={self._true_ate:.4f}, model={current_ate:.4f})"
+            f"(reference={self.reference_ate:.4f}, model={current_ate:.4f})"
         )
 
         scores = {}
@@ -477,14 +475,14 @@ class CLAIM(Mechanism):
         # omitted, this computes the estimator on the sensitive data and should
         # be used only for experiments/debugging.
         if self.selection_mode in ("ate", "claim"):
-            if self._true_ate is None:
+            if self.reference_ate is None:
                 warnings.warn(
                     "Computing reference ATE directly from private data. "
                     "For a formal privacy guarantee, pass a DP reference_ate.",
                     RuntimeWarning,
                 )
-                self._true_ate = self.compute_ate_from_data(data.df)
-            print(f"Reference ATE: {self._true_ate:.6f}")
+                self.reference_ate = self.compute_ate_from_data(data.df)
+            print(f"Reference ATE: {self.reference_ate:.6f}")
 
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
@@ -531,11 +529,6 @@ class CLAIM(Mechanism):
 
             small_candidates = filter_candidates(candidates, model, size_limit)
 
-            # Optional one-run adaptive lambda update.  Decreasing lambda gives
-            # more weight to the causal term; increasing lambda gives more
-            # weight to the statistical/marginal term.
-            self._maybe_update_lambda(model)
-
             # Branch on selection mode
             if self.selection_mode == "ate":
                 cl = self.worst_ate_approximated(
@@ -563,6 +556,13 @@ class CLAIM(Mechanism):
             model = estimation.mirror_descent(
                     data.domain, measurements, iters=self.max_iters, potentials=potentials, callback_fn=lambda *_: None
             )
+
+            # Optional one-run adaptive lambda update. This happens after the
+            # model update, so lambda_{t+1} reacts to the newest DP transcript.
+            # Decreasing lambda gives more weight to the causal term; increasing
+            # lambda gives more weight to the statistical/marginal term.
+            self._maybe_update_lambda(model)
+
             w = model.project(cl).datavector()
             # print('Selected',cl,'Size',n,'Budget Used',rho_used/self.rho)
             if np.linalg.norm(w - z, 1) <= sigma * np.sqrt(2 / np.pi) * n:
@@ -631,6 +631,11 @@ def pilot_select_lambda(
         reference_ate = tmp.compute_ate_from_data(data.df)
         claim_kwargs["reference_ate"] = reference_ate
 
+    base_claim_kwargs = dict(claim_kwargs)
+    base_claim_kwargs.pop("lambda_weight", None)
+    base_claim_kwargs.pop("adaptive_lambda", None)
+    base_claim_kwargs.pop("lambda_schedule", None)
+
     scores = {}
     pilot_outputs = {}
     for lam in lambda_values:
@@ -639,8 +644,8 @@ def pilot_select_lambda(
             pilot_epsilon,
             delta,
             lambda_weight=lam,
-            lambda_schedule="fixed",
-            **claim_kwargs,
+            adaptive_lambda=False,
+            **base_claim_kwargs,
         )
         model, synth = mech.run(data, workload, num_synth_rows=num_synth_rows)
         errors = []
@@ -662,8 +667,8 @@ def pilot_select_lambda(
         final_epsilon,
         delta,
         lambda_weight=selected_lambda,
-        lambda_schedule="fixed",
-        **claim_kwargs,
+        adaptive_lambda=False,
+        **base_claim_kwargs,
     )
     final_model, final_synth = final_mech.run(
         data, workload, num_synth_rows=num_synth_rows
@@ -692,13 +697,13 @@ def default_params():
     params["lambda_weight"] = 0.5
     params["mu"] = 1.0
     params["kappa"] = 1.0
-    params["lambda_schedule"] = "fixed"
+    params["adaptive_lambda"] = False
     params["lambda_min"] = 0.1
     params["lambda_max"] = 0.9
     params["lambda_update_factor"] = 1.25
-    params["ate_tolerance"] = None
+    params["ate_tolerance"] = 0.01
     params["reference_ate"] = None
-    params["pilot_lambda"] = False
+    params["fixed_lambda_from_list"] = False
     params["lambda_values"] = "0.1,0.5,0.9"
     params["pilot_fraction"] = 0.15
     params["pilot_samples"] = 5
@@ -751,9 +756,9 @@ if __name__ == "__main__":
     parser.add_argument("--mu", type=float, help="Scale multiplier for causal term")
     parser.add_argument("--kappa", type=float, help="Normalizer for causal term")
     parser.add_argument(
-        "--lambda_schedule",
-        choices=["fixed", "adaptive"],
-        help="Use fixed lambda or adapt lambda during one CLAIM run"
+        "--adaptive_lambda",
+        action="store_true",
+        help="Adapt lambda during one CLAIM run using the current model ATE error"
     )
     parser.add_argument("--lambda_min", type=float, help="Minimum adaptive lambda")
     parser.add_argument("--lambda_max", type=float, help="Maximum adaptive lambda")
@@ -763,9 +768,11 @@ if __name__ == "__main__":
         help="Multiplicative adaptive lambda update factor"
     )
     parser.add_argument(
+        "--ate-tolerance",
         "--ate_tolerance",
+        dest="ate_tolerance",
         type=float,
-        help="ATE-error tolerance for adaptive lambda; required when lambda_schedule=adaptive"
+        help="ATE-error tolerance for adaptive lambda"
     )
     parser.add_argument(
         "--reference_ate",
@@ -773,9 +780,9 @@ if __name__ == "__main__":
         help="Privately released/reference ATE. If omitted in ATE/CLAIM mode, raw-data ATE is computed for experiments only."
     )
     parser.add_argument(
-        "--pilot_lambda",
+        "--fixed_lambda_from_list",
         action="store_true",
-        help="Run pilot lambda selection over --lambda_values before the final run"
+        help="Select lambda from --lambda_values using small pilot runs before the final run"
     )
     parser.add_argument(
         "--lambda_values",
@@ -836,6 +843,9 @@ if __name__ == "__main__":
 
     workload = [(cl, 1.0) for cl in workload]
 
+    if args.fixed_lambda_from_list and args.adaptive_lambda:
+        raise ValueError("Use either --fixed_lambda_from_list or --adaptive_lambda, not both")
+
     claim_kwargs = dict(
         max_model_size=args.max_model_size,
         max_iters=args.max_iters,
@@ -847,7 +857,7 @@ if __name__ == "__main__":
         lambda_weight=args.lambda_weight,
         mu=args.mu,
         kappa=args.kappa,
-        lambda_schedule=args.lambda_schedule,
+        adaptive_lambda=args.adaptive_lambda,
         lambda_min=args.lambda_min,
         lambda_max=args.lambda_max,
         lambda_update_factor=args.lambda_update_factor,
@@ -857,7 +867,7 @@ if __name__ == "__main__":
 
     selected_lambda = None
     lambda_scores = None
-    if args.pilot_lambda:
+    if args.fixed_lambda_from_list:
         lambda_values = [float(x.strip()) for x in args.lambda_values.split(',') if x.strip()]
         selected_lambda, lambda_scores, model, synth = pilot_select_lambda(
             data,
@@ -872,7 +882,7 @@ if __name__ == "__main__":
         mech = CLAIM(
             args.epsilon,
             args.delta,
-            **{**claim_kwargs, "lambda_weight": selected_lambda, "lambda_schedule": "fixed"},
+            **{**claim_kwargs, "lambda_weight": selected_lambda, "adaptive_lambda": False},
         )
     else:
         mech = CLAIM(args.epsilon, args.delta, **claim_kwargs)
@@ -887,7 +897,7 @@ if __name__ == "__main__":
 
     # Print ATE comparison if in ATE/CLAIM mode
     if args.selection_mode in ("ate", "claim"):
-        true_ate = mech._true_ate or args.reference_ate
+        true_ate = mech.reference_ate
         if true_ate is None:
             true_ate = mech.compute_ate_from_data(data.df)
         synth_ate = mech.compute_ate_from_data(synth.df)
