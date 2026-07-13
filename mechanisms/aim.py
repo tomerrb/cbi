@@ -94,16 +94,64 @@ class CLAIM(Mechanism):
             "claim" (blended marginal/ATE) selection.
         lambda_weight: Weight on the marginal/statistical term. Smaller values
             give more weight to the causal/ATE term.
-        mu: Scale multiplier for the causal term in blended CLAIM selection.
-        kappa: Optional normalizer for the causal term.
+        mu_eta: Small positive constant preventing division by zero in the
+            theory-derived scale parameter mu. mu is no longer a free
+            hyperparameter: it is recomputed each selection round as the ratio
+            between the typical (median) magnitudes of the two score terms
+            over the candidate set,
+                mu_t = median_r |L_hat_r| / (kappa * median_r |A_hat_r| + mu_eta),
+            where L_hat_r and A_hat_r are *public proxies* of the statistical
+            and causal terms obtained by evaluating them on the previous
+            models instead of the private data: L_hat_r compares the current
+            model's marginal on r against the previous round's model (minus
+            the expected noise bias), and A_hat_r is the causal term with the
+            data replaced by the current model (using an FWL linear ATE
+            estimator computed from the model itself). Both proxies read only
+            DP-released quantities, so mu_t is public. If no candidate clique
+            covers {treatment, outcome} + confounders, all A_hat_r are zero
+            and mu_t falls back to median_r |L_hat_r| / mu_eta.
+        kappa_eta: Minimum-variance floor for the theory-derived normalizer
+            kappa. kappa is no longer a free hyperparameter: it is recomputed
+            each selection round as kappa = (sum_i beta_i / v_i)^{-1}, which
+            for the single causal query used here (beta = 1) reduces to
+            kappa = v, the residual treatment variance
+            v = E_{p_hat}[(T - P_hat(T=1|Z))^2] under the current model. This
+            is the value required by the sensitivity analysis so that the
+            causal term's contribution to the quality-score sensitivity
+            matches the statistical term's (2/N). To guard against the
+            degenerate case v = 0, kappa is clipped below at kappa_eta.
         adaptive_lambda: If True, lambda_weight is adjusted at the end of each round
-            using current model ATE error.
+            using both the current model's ATE error and its TVD (marginal) error,
+            so that chasing ATE improvements cannot come at unbounded cost to TVD
+            preservation, and vice versa.
         treatment: Treatment variable name (required for ATE/CLAIM modes).
         outcome: Outcome variable name (required for ATE mode).
         confounders: List of confounder variable names (required for ATE mode).
         causal_graph_path: Path to GML file with causal graph (required for ATE mode).
         ate_sample_size: Samples for final ATE computation (default: 10000).
         sim_sample_size: Samples for simulation during selection (default: 5000).
+        reference_ate: Precomputed reference ATE. If provided, treated as
+            already private (e.g. computed outside this class with its own DP
+            guarantee) and used as-is.
+        ate_sensitivity: Assumed L2 sensitivity of the raw-data ATE estimator
+            under one record changing. If `reference_ate` is omitted, a
+            reference ATE is auto-released privately instead: computed on raw
+            data, then perturbed with Gaussian noise calibrated for zCDP using
+            `reference_ate_rho_fraction * rho`, which is deducted from the
+            remaining budget before selection rounds start. Defaults to
+            `(ate_outcome_range[1] - ate_outcome_range[0]) / data.records`
+            (the sensitivity of a difference-in-means estimator over an
+            outcome bounded to `ate_outcome_range`) if not set explicitly.
+        reference_ate_rho_fraction: Fraction of the total zCDP budget spent on
+            auto-releasing a private reference ATE when `reference_ate` is
+            not supplied (default: 0.05).
+        ate_outcome_range: (min, max) the outcome column is assumed (and
+            enforced) to lie in for ATE computation. Every outcome value is
+            clipped into this range before `compute_ate_from_data` runs, so
+            the sensitivity default above holds by construction rather than
+            by caller discipline. Defaults to (-1.0, 1.0). If the outcome's
+            natural scale doesn't match this, rescale it yourself before
+            passing data in, or override this range accordingly.
     """
 
     def __init__(
@@ -117,14 +165,18 @@ class CLAIM(Mechanism):
         structural_zeros={},
         selection_mode="marginal",
         lambda_weight=0.5,
-        mu=1.0,
-        kappa=1.0,
+        mu_eta=1e-6,
+        kappa_eta=1e-6,
         adaptive_lambda=False,
         lambda_min=0.1,
         lambda_max=0.9,
         lambda_update_factor=1.25,
         ate_tolerance=0.01,
+        tvd_tolerance=0.05,
         reference_ate=None,
+        ate_sensitivity=None,
+        reference_ate_rho_fraction=0.05,
+        ate_outcome_range=(-1.0, 1.0),
         treatment=None,
         outcome=None,
         confounders=None,
@@ -148,14 +200,25 @@ class CLAIM(Mechanism):
 
         # CLAIM lambda configuration
         self.lambda_weight = float(lambda_weight)
-        self.mu = float(mu)
-        self.kappa = float(kappa)
+        # mu and kappa are derived from the theory each selection round
+        # (see _compute_mu and _model_treatment_variance); mu_eta and
+        # kappa_eta are only small-value safeguards.
+        self.mu_eta = float(mu_eta)
+        if self.mu_eta <= 0:
+            raise ValueError("mu_eta must be positive")
+        self.mu = None
+        self.kappa_eta = float(kappa_eta)
+        if self.kappa_eta <= 0:
+            raise ValueError("kappa_eta must be positive")
+        self.kappa = None
+        self._prev_model = None  # p_hat_{t-2}, for the public mu proxies
         self.adaptive_lambda = bool(adaptive_lambda)
         self.lambda_schedule = "adaptive" if self.adaptive_lambda else "fixed"
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
         self.lambda_update_factor = float(lambda_update_factor)
         self.ate_tolerance = ate_tolerance
+        self.tvd_tolerance = tvd_tolerance
         if not (0.0 <= self.lambda_weight <= 1.0):
             raise ValueError("lambda_weight must be in [0, 1]")
         if not (0.0 <= self.lambda_min <= self.lambda_max <= 1.0):
@@ -173,6 +236,15 @@ class CLAIM(Mechanism):
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
         self.reference_ate = reference_ate
+        self.ate_sensitivity = ate_sensitivity
+        self.reference_ate_rho_fraction = float(reference_ate_rho_fraction)
+        self.ate_outcome_range = (float(ate_outcome_range[0]), float(ate_outcome_range[1]))
+        if not (0.0 < self.reference_ate_rho_fraction < 1.0):
+            raise ValueError("reference_ate_rho_fraction must be in (0, 1)")
+        if self.ate_sensitivity is not None and self.ate_sensitivity <= 0:
+            raise ValueError("ate_sensitivity must be positive")
+        if self.ate_outcome_range[0] >= self.ate_outcome_range[1]:
+            raise ValueError("ate_outcome_range must satisfy min < max")
 
         if selection_mode in ("ate", "claim"):
             # Validate required causal parameters
@@ -187,6 +259,15 @@ class CLAIM(Mechanism):
     def compute_ate_from_data(self, df):
         """Compute ATE using DoWhy's backdoor adjustment.
 
+        The outcome column is clipped into `self.ate_outcome_range` first, so
+        the `ate_outcome_range`-derived sensitivity used by
+        `_release_private_reference_ate` holds by construction rather than by
+        caller discipline. If clipping actually changes any values, a warning
+        is raised, since it means the outcome's natural scale doesn't match
+        `ate_outcome_range` and the resulting ATE is computed on distorted
+        data (rescale the outcome yourself, or override `ate_outcome_range`,
+        to avoid this).
+
         Args:
             df: DataFrame containing treatment, outcome, and confounder columns.
 
@@ -195,6 +276,22 @@ class CLAIM(Mechanism):
         """
         # Late import to avoid dependency when not using ATE mode
         from dowhy import CausalModel
+
+        lo, hi = self.ate_outcome_range
+        outcome_col = df[self.outcome]
+        clipped = outcome_col.clip(lower=lo, upper=hi)
+        if not clipped.equals(outcome_col):
+            warnings.warn(
+                f"Outcome '{self.outcome}' has values outside ate_outcome_range="
+                f"{self.ate_outcome_range}; clipping into range. This distorts "
+                "the ATE estimate and the sensitivity assumed for private "
+                "reference-ATE release -- rescale the outcome to match "
+                "ate_outcome_range, or override ate_outcome_range to match "
+                "the outcome's true scale.",
+                RuntimeWarning,
+            )
+            df = df.copy()
+            df[self.outcome] = clipped
 
         model = CausalModel(
             data=df,
@@ -382,33 +479,195 @@ class CLAIM(Mechanism):
         ate = self.compute_ate_from_data(df)
         return abs(self.reference_ate - ate), ate
 
-    def _maybe_update_lambda(self, model):
-        """Update lambda_weight using current model ATE error.
+    def _tvd_error_for_model(self, model, measurements, cliques):
+        """Average total variation distance between the model and the DP-released marginals.
 
-        Smaller lambda means more causal weight.  If the current model does not
-        preserve ATE well enough, decrease lambda.  If the current model is good
-        enough, increase lambda to give more weight to statistical fidelity.
+        This compares against the noisy `noisy_measurement` already released for
+        each clique in `measurements`, not the true raw marginal. That noisy
+        value's privacy cost was already paid for and accounted in `rho_used`
+        when it was measured, so reading it back here is pure post-processing
+        and does not touch sensitive data directly.
+
+        Args:
+            model: Current fitted PGM model.
+            measurements: List of LinearMeasurement objects released so far.
+            cliques: Cliques to average the TVD over (e.g. the one-way marginals).
+                Only cliques with a matching entry in `measurements` are used.
+
+        Returns:
+            float: Mean (approximate) TVD across the matched cliques.
+        """
+        noisy_by_clique = {m.clique: m.noisy_measurement for m in measurements if m.clique in cliques}
+        used_cliques = [cl for cl in cliques if cl in noisy_by_clique]
+        if not used_cliques:
+            raise ValueError("no noisy measurements available for the requested TVD cliques")
+
+        total = 0.0
+        for cl in used_cliques:
+            y = noisy_by_clique[cl]
+            xest = model.project(cl).datavector()
+            total += 0.5 * np.linalg.norm(y - xest, 1) / y.sum()
+        return total / len(used_cliques)
+
+    def _adjust_lambda(self, current_lambda, tvd_error, ate_error):
+        """Combine last iteration's TVD and ATE errors into a new lambda_weight.
+
+        Both errors are judged against their own tolerance. Lambda only moves
+        toward the causal term (decreases) when TVD is already within tolerance,
+        i.e. there is fidelity "slack" to trade for a causal improvement. If TVD
+        is not preserved, lambda moves toward (or stays at) the statistical term
+        regardless of how large the ATE error is, so TVD preservation can no
+        longer be sacrificed without bound to chase ATE. When neither error is
+        within tolerance, lambda moves toward whichever objective is relatively
+        further from its own tolerance.
+        """
+        ate_ok = ate_error <= self.ate_tolerance
+        tvd_ok = tvd_error <= self.tvd_tolerance
+
+        if ate_ok and tvd_ok:
+            return current_lambda
+        if tvd_ok and not ate_ok:
+            return max(self.lambda_min, current_lambda / self.lambda_update_factor)
+        if ate_ok and not tvd_ok:
+            return min(self.lambda_max, current_lambda * self.lambda_update_factor)
+
+        # Neither preserved: favor whichever is relatively worse against its tolerance.
+        ate_ratio = ate_error / self.ate_tolerance
+        tvd_ratio = tvd_error / self.tvd_tolerance
+        if tvd_ratio >= ate_ratio:
+            return min(self.lambda_max, current_lambda * self.lambda_update_factor)
+        return max(self.lambda_min, current_lambda / self.lambda_update_factor)
+
+    def _maybe_update_lambda(self, model, measurements, cliques):
+        """Update lambda_weight using both ATE error and TVD error from the last iteration.
+
+        Smaller lambda means more causal weight. See `_adjust_lambda` for the
+        precise rule that keeps TVD preservation from being sacrificed without
+        bound while still letting lambda decrease when there is fidelity slack.
+
+        Note: the ATE side of this still relies on `self.reference_ate`, which
+        defaults to a non-private (raw-data) computation unless a DP-released
+        reference_ate is passed in explicitly (see `run()`). The TVD side is
+        private post-processing, since it only reads already-released noisy
+        measurements.
         """
         if not self.adaptive_lambda or self.selection_mode != "claim":
             return
         if self.ate_tolerance is None:
             raise ValueError("adaptive lambda requires ate_tolerance")
+        if self.tvd_tolerance is None:
+            raise ValueError("adaptive lambda requires tvd_tolerance")
 
-        current_error, current_ate = self._ate_error_for_model(model, seed=42)
+        current_ate_error, current_ate = self._ate_error_for_model(model, seed=42)
+        current_tvd_error = self._tvd_error_for_model(model, measurements, cliques)
         old_lambda = self.lambda_weight
-        if current_error > self.ate_tolerance:
-            self.lambda_weight = max(
-                self.lambda_min, self.lambda_weight / self.lambda_update_factor
-            )
-        else:
-            self.lambda_weight = min(
-                self.lambda_max, self.lambda_weight * self.lambda_update_factor
-            )
+        self.lambda_weight = self._adjust_lambda(
+            old_lambda, current_tvd_error, current_ate_error
+        )
         print(
             "Adaptive lambda: "
-            f"ATE error={current_error:.6f}, model ATE={current_ate:.6f}, "
+            f"ATE error={current_ate_error:.6f} (tol={self.ate_tolerance:.4f}), "
+            f"model ATE={current_ate:.6f}, "
+            f"TVD error={current_tvd_error:.6f} (tol={self.tvd_tolerance:.4f}), "
             f"lambda {old_lambda:.4f} -> {self.lambda_weight:.4f}"
         )
+
+    def _model_treatment_variance(self, model):
+        """Residual treatment variance v = E_{p_hat}[(T - E_hat[T|Z])^2] under the model.
+
+        This is the nuisance parameter v_i from the FWL sensitivity analysis,
+        computed from the current PGM model's marginal over (treatment,
+        confounders). It is a function of DP-released quantities only, so it
+        is public. Treatment values are taken to be their (integer) domain
+        indices, which for a binary 0/1 treatment gives
+        v = E_z[ P(T=1|z) * (1 - P(T=1|z)) ].
+
+        Returns:
+            float: The residual treatment variance under the model.
+        """
+        cl = tuple([self.treatment] + list(self.confounders))
+        counts = np.asarray(model.project(cl).datavector(), dtype=float)
+        shape = [model.domain.size((a,)) for a in cl]
+        joint = counts.reshape(shape)
+        joint = np.clip(joint, 0.0, None)
+        total = joint.sum()
+        if total <= 0:
+            return 0.0
+        p = joint / total  # p(t, z), treatment on axis 0
+        t_vals = np.arange(shape[0], dtype=float).reshape([-1] + [1] * (len(shape) - 1))
+        pz = p.sum(axis=0)  # p(z)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tbar = np.where(pz > 0, (t_vals * p).sum(axis=0) / pz, 0.0)  # E[T|z]
+        v = float(np.sum(p * (t_vals - tbar) ** 2))
+        return v
+
+    def _model_fwl_ate(self, model):
+        """FWL linear ATE estimator evaluated on the model itself (public).
+
+        Computes tau_fwl = E_p[Y * (T - E_p[T|Z])] / v over the model's
+        marginal on (treatment, outcome, confounders), with the nuisances
+        (conditional treatment mean and residual treatment variance v) also
+        taken from the model. Treatment and outcome values are taken to be
+        their integer domain indices, consistent with
+        _model_treatment_variance. This is the public proxy tau_hat^r(p_hat)
+        used by the mu_t computation; it reads only the DP-released model.
+
+        Returns:
+            float: The FWL linear ATE estimate under the model.
+        """
+        cl = tuple([self.treatment, self.outcome] + list(self.confounders))
+        counts = np.asarray(model.project(cl).datavector(), dtype=float)
+        shape = [model.domain.size((a,)) for a in cl]
+        joint = np.clip(counts.reshape(shape), 0.0, None)
+        total = joint.sum()
+        if total <= 0:
+            return 0.0
+        p = joint / total  # p(t, y, z...), treatment axis 0, outcome axis 1
+        t_vals = np.arange(shape[0], dtype=float).reshape([-1, 1] + [1] * (len(shape) - 2))
+        y_vals = np.arange(shape[1], dtype=float).reshape([1, -1] + [1] * (len(shape) - 2))
+        pz = p.sum(axis=(0, 1))  # p(z)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tbar = np.where(pz > 0, (t_vals * p).sum(axis=(0, 1)) / pz, 0.0)  # E[T|z]
+        v = max(self._model_treatment_variance(model), self.kappa_eta)
+        return float(np.sum(p * y_vals * (t_vals - tbar)) / v)
+
+    def _compute_mu(self, candidates, model, sigma, current_ate):
+        """Theory-derived public scale parameter mu_t.
+
+        Implements the paper's definition
+            mu_t = median_r |L_hat_r| / (kappa * median_r |A_hat_r| + mu_eta),
+        where the proxies substitute released models for the private data:
+        - L_hat_r = ||M_r(p_hat_{t-1}) - M_r(p_hat_{t-2})||_1 - bias, the
+          statistical term with the current and previous round's models in
+          place of (data, model). On the first round p_hat_{t-2} is taken to
+          be p_hat_{t-1}, so |L_hat_r| reduces to the noise bias.
+        - A_hat_r = |ref - tau(p_hat_{t-1})| - |ref - tau_fwl(p_hat_{t-1})|
+          for candidates covering {treatment, outcome} + confounders, and 0
+          otherwise (mirroring the FWL estimator's covering condition).
+        Everything here is post-processing of DP-released quantities, so mu_t
+        is public and the score's sensitivity analysis is unaffected.
+        """
+        prev_model = self._prev_model if self._prev_model is not None else model
+        stat_proxies = []
+        for cl in candidates:
+            x_new = model.project(cl).datavector()
+            x_old = prev_model.project(cl).datavector()
+            bias = np.sqrt(2 / np.pi) * sigma * model.domain.size(cl)
+            stat_proxies.append(abs(np.linalg.norm(x_new - x_old, 1) - bias))
+
+        causal_clique = set([self.treatment, self.outcome] + list(self.confounders))
+        tau_fwl = self._model_fwl_ate(model)
+        a_cover = abs(
+            abs(self.reference_ate - current_ate) - abs(self.reference_ate - tau_fwl)
+        )
+        causal_proxies = [
+            a_cover if causal_clique <= set(cl) else 0.0 for cl in candidates
+        ]
+        mu = float(
+            np.median(stat_proxies)
+            / (self.kappa * np.median(causal_proxies) + self.mu_eta)
+        )
+        return mu
 
     def _claim_candidate_scores(self, candidates, answers, data, model, measurements, sigma):
         """Compute blended CLAIM scores for candidate cliques.
@@ -425,6 +684,17 @@ class CLAIM(Mechanism):
             f"Current ATE error: {current_error:.6f} "
             f"(reference={self.reference_ate:.4f}, model={current_ate:.4f})"
         )
+
+        # Theory-derived kappa = (sum_i beta_i / v_i)^{-1}; with the single
+        # causal query here (beta = 1) this is the residual treatment variance
+        # under the current model, floored at kappa_eta (degenerate case v=0).
+        self.kappa = max(self._model_treatment_variance(model), self.kappa_eta)
+        print(f"Theory-derived kappa (residual treatment variance): {self.kappa:.6g}")
+
+        # Theory-derived mu_t: median statistical proxy over median causal
+        # proxy (see _compute_mu). Public post-processing of released models.
+        self.mu = self._compute_mu(candidates, model, sigma, current_ate)
+        print(f"Theory-derived mu_t (median stat/causal proxy ratio): {self.mu:.6g}")
 
         scores = {}
         stat_scores = {}
@@ -469,19 +739,45 @@ class CLAIM(Mechanism):
         sensitivity = max(sensitivity, 1e-12)
         return self.exponential_mechanism(scores, eps, sensitivity)
 
+    def _release_private_reference_ate(self, data):
+        """Auto-release a one-shot private reference ATE from a slice of rho.
+
+        Spends `reference_ate_rho_fraction * self.rho` of the total zCDP
+        budget on a single Gaussian-mechanism release of the raw-data ATE
+        estimate. Calibrated using `self.ate_sensitivity` as the assumed L2
+        sensitivity of the estimator under one record changing, defaulting to
+        `(ate_outcome_range[1] - ate_outcome_range[0]) / data.records` when
+        not set explicitly (the sensitivity of a difference-in-means
+        estimator over an outcome bounded to `ate_outcome_range`, which
+        `compute_ate_from_data` enforces by clipping). The spent amount is
+        deducted from `self.rho` so the selection rounds that follow see the
+        reduced remaining budget; this is a genuine privacy expenditure, not
+        post-processing.
+        """
+        sensitivity = self.ate_sensitivity
+        if sensitivity is None:
+            lo, hi = self.ate_outcome_range
+            sensitivity = (hi - lo) / data.records
+        ate_rho = self.reference_ate_rho_fraction * self.rho
+        raw_ate = self.compute_ate_from_data(data.df)
+        sigma_ate = sensitivity / np.sqrt(2 * ate_rho)
+        private_ate = float(raw_ate + self.gaussian_noise(sigma_ate, 1)[0])
+        self.rho -= ate_rho
+        print(
+            "Auto-released private reference ATE: "
+            f"{private_ate:.6f} (raw={raw_ate:.6f}, sensitivity={sensitivity:.6g}, "
+            f"rho spent={ate_rho:.6g}, sigma={sigma_ate:.6g}, "
+            f"remaining rho={self.rho:.6g})"
+        )
+        return private_ate
+
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
-        # Cache reference ATE at the start if using ATE/CLAIM mode.  For formal
-        # privacy, pass a privately released reference_ate.  If reference_ate is
-        # omitted, this computes the estimator on the sensitive data and should
-        # be used only for experiments/debugging.
+        # Cache reference ATE at the start if using ATE/CLAIM mode. If
+        # reference_ate is omitted, one is auto-released privately from a
+        # fraction of rho instead of being computed non-privately.
         if self.selection_mode in ("ate", "claim"):
             if self.reference_ate is None:
-                warnings.warn(
-                    "Computing reference ATE directly from private data. "
-                    "For a formal privacy guarantee, pass a DP reference_ate.",
-                    RuntimeWarning,
-                )
-                self.reference_ate = self.compute_ate_from_data(data.df)
+                self.reference_ate = self._release_private_reference_ate(data)
             print(f"Reference ATE: {self.reference_ate:.6f}")
 
         rounds = self.rounds or 16 * len(data.domain)
@@ -553,6 +849,9 @@ class CLAIM(Mechanism):
             # TODO: check if it helps to call maximal_subsets here
             pcliques = list(set(M.clique for M in measurements))
             potentials = model.potentials.expand(pcliques)
+            # Keep the pre-update model (p_hat_{t-2} for the next round's
+            # selection): it is used by the public mu_t proxies.
+            self._prev_model = model
             model = estimation.mirror_descent(
                     data.domain, measurements, iters=self.max_iters, potentials=potentials, callback_fn=lambda *_: None
             )
@@ -561,7 +860,7 @@ class CLAIM(Mechanism):
             # model update, so lambda_{t+1} reacts to the newest DP transcript.
             # Decreasing lambda gives more weight to the causal term; increasing
             # lambda gives more weight to the statistical/marginal term.
-            self._maybe_update_lambda(model)
+            self._maybe_update_lambda(model, measurements, oneway)
 
             w = model.project(cl).datavector()
             # print('Selected',cl,'Size',n,'Budget Used',rho_used/self.rho)
@@ -695,14 +994,19 @@ def default_params():
     # Selection mode: "marginal", "ate", or "claim"
     params["selection_mode"] = "marginal"
     params["lambda_weight"] = 0.5
-    params["mu"] = 1.0
-    params["kappa"] = 1.0
+    params["mu_eta"] = 1e-6
+    params["kappa_eta"] = 1e-6
     params["adaptive_lambda"] = False
     params["lambda_min"] = 0.1
     params["lambda_max"] = 0.9
     params["lambda_update_factor"] = 1.25
     params["ate_tolerance"] = 0.01
+    params["tvd_tolerance"] = 0.05
     params["reference_ate"] = None
+    params["ate_sensitivity"] = None
+    params["reference_ate_rho_fraction"] = 0.05
+    params["ate_outcome_min"] = -1.0
+    params["ate_outcome_max"] = 1.0
     params["fixed_lambda_from_list"] = False
     params["lambda_values"] = "0.1,0.5,0.9"
     params["pilot_fraction"] = 0.15
@@ -753,8 +1057,21 @@ if __name__ == "__main__":
         type=float,
         help="Weight on marginal/statistical term; smaller gives more causal weight"
     )
-    parser.add_argument("--mu", type=float, help="Scale multiplier for causal term")
-    parser.add_argument("--kappa", type=float, help="Normalizer for causal term")
+    parser.add_argument(
+        "--mu_eta",
+        type=float,
+        help="Small positive constant preventing division by zero in the "
+        "theory-derived scale parameter mu (mu itself is computed each round "
+        "as the ratio of median statistical to median causal proxy magnitudes "
+        "and is no longer a free parameter)"
+    )
+    parser.add_argument(
+        "--kappa_eta",
+        type=float,
+        help="Variance floor for the theory-derived normalizer kappa "
+        "(kappa itself is computed each round as the model's residual "
+        "treatment variance and is no longer a free parameter)"
+    )
     parser.add_argument(
         "--adaptive_lambda",
         action="store_true",
@@ -775,9 +1092,36 @@ if __name__ == "__main__":
         help="ATE-error tolerance for adaptive lambda"
     )
     parser.add_argument(
+        "--tvd-tolerance",
+        "--tvd_tolerance",
+        dest="tvd_tolerance",
+        type=float,
+        help="TVD-error tolerance for adaptive lambda"
+    )
+    parser.add_argument(
         "--reference_ate",
         type=float,
-        help="Privately released/reference ATE. If omitted in ATE/CLAIM mode, raw-data ATE is computed for experiments only."
+        help="Precomputed/privately-released reference ATE. If omitted in ATE/CLAIM mode, one is auto-released privately from a fraction of rho instead."
+    )
+    parser.add_argument(
+        "--ate_sensitivity",
+        type=float,
+        help="Assumed L2 sensitivity of the ATE estimator, used when auto-releasing a private reference ATE. Defaults to (ate_outcome_max - ate_outcome_min)/records if omitted."
+    )
+    parser.add_argument(
+        "--reference_ate_rho_fraction",
+        type=float,
+        help="Fraction of total zCDP budget spent auto-releasing a private reference ATE (used only when --reference_ate is omitted)"
+    )
+    parser.add_argument(
+        "--ate_outcome_min",
+        type=float,
+        help="Minimum value the outcome column is clipped to before ATE computation (enforces the sensitivity assumption)"
+    )
+    parser.add_argument(
+        "--ate_outcome_max",
+        type=float,
+        help="Maximum value the outcome column is clipped to before ATE computation (enforces the sensitivity assumption)"
     )
     parser.add_argument(
         "--fixed_lambda_from_list",
@@ -855,14 +1199,18 @@ if __name__ == "__main__":
         confounders=confounders_list,
         causal_graph_path=args.causal_graph,
         lambda_weight=args.lambda_weight,
-        mu=args.mu,
-        kappa=args.kappa,
+        mu_eta=args.mu_eta,
+        kappa_eta=args.kappa_eta,
         adaptive_lambda=args.adaptive_lambda,
         lambda_min=args.lambda_min,
         lambda_max=args.lambda_max,
         lambda_update_factor=args.lambda_update_factor,
         ate_tolerance=args.ate_tolerance,
+        tvd_tolerance=args.tvd_tolerance,
         reference_ate=args.reference_ate,
+        ate_sensitivity=args.ate_sensitivity,
+        reference_ate_rho_fraction=args.reference_ate_rho_fraction,
+        ate_outcome_range=(args.ate_outcome_min, args.ate_outcome_max),
     )
 
     selected_lambda = None
