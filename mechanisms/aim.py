@@ -1075,7 +1075,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--adaptive_lambda",
         action="store_true",
-        help="Adapt lambda during one CLAIM run using the current model ATE error"
+        help="Adapt lambda during one CLAIM run using the current model's ATE and TVD error"
     )
     parser.add_argument("--lambda_min", type=float, help="Minimum adaptive lambda")
     parser.add_argument("--lambda_max", type=float, help="Maximum adaptive lambda")
