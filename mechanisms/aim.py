@@ -362,9 +362,21 @@ class CLAIM(Mechanism):
         Returns:
             DataFrame: Synthetic data.
         """
-        if seed is not None:
+        if seed is None:
+            return model.synthetic_data(rows=num_samples).df
+        # Scope the fixed evaluation seed: save and restore the global RNG
+        # state so it cannot leak into the mechanism's noise draws. Reseeding
+        # np.random globally with a constant (as done previously) made every
+        # subsequent Gaussian measurement noise draw a deterministic function
+        # of seed=42 and the number of variates consumed by sampling -- noise
+        # could repeat across rounds, violating the fresh-randomness
+        # assumption behind the Gaussian mechanism's zCDP guarantee.
+        state = np.random.get_state()
+        try:
             np.random.seed(seed)
-        synth = model.synthetic_data(rows=num_samples)
+            synth = model.synthetic_data(rows=num_samples)
+        finally:
+            np.random.set_state(state)
         return synth.df
 
     def _simulate_measurement(self, model, data, clique, measurements):
@@ -549,7 +561,7 @@ class CLAIM(Mechanism):
         for cl in used_cliques:
             y = noisy_by_clique[cl]
             xest = model.project(cl).datavector()
-            total += 0.5 * np.linalg.norm(y - xest, 1) / y.sum()
+            total += 0.5 * np.linalg.norm(y - xest, 1) / max(float(np.sum(y)), 1e-12)
         return total / len(used_cliques)
 
     def _derived_tolerances(self, measurements, cliques):
