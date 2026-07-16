@@ -120,7 +120,22 @@ class CLAIM(Mechanism):
             causal term's contribution to the quality-score sensitivity
             matches the statistical term's (2/N). To guard against the
             degenerate case v = 0, kappa is clipped below at kappa_eta.
-        adaptive_lambda: If True, lambda_weight is adjusted at the end of each round
+        ate_tolerance: Tolerance theta_A on the model's ATE error for the
+            adaptive lambda schedule. Default None: derived each round from
+            the public noise floors as z * (sigma_ATE + sigma_MC), where
+            sigma_ATE is the noise scale of the private reference-ATE release
+            (0 if reference_ate was supplied externally), sigma_MC =
+            (y_max - y_min) / sqrt(sim_sample_size) is a conservative bound
+            on the Monte-Carlo error of the model-ATE estimate, and
+            z = TOLERANCE_Z. Rationale: below this floor even a perfect model
+            fails the test routinely, so the schedule would chase noise.
+        tvd_tolerance: Tolerance theta_L on the model's average one-way TVD
+            error for the adaptive lambda schedule. Default None: derived
+            each round as z times the expected TVD a *perfect* model would
+            show against the noisy released marginals,
+            z * mean_r [ sqrt(2/pi) * sigma_r * n_r / (2 * sum(y_r)) ],
+            all of which is computable from the DP transcript.
+        adaptive_lambda: If True (the default), lambda_weight is adjusted at the end of each round
             using both the current model's ATE error and its TVD (marginal) error,
             so that chasing ATE improvements cannot come at unbounded cost to TVD
             preservation, and vice versa.
@@ -154,6 +169,18 @@ class CLAIM(Mechanism):
             passing data in, or override this range accordingly.
     """
 
+    # Fixed constants of the adaptive-lambda schedule. Like AIM's alpha = 0.9
+    # and T = 16d, these are not user inputs:
+    # - LAMBDA_UPDATE_FACTOR is the multiplicative step c; it only provides
+    #   damping and lets lambda traverse [lambda_min, lambda_max] in a
+    #   handful of rounds while a single noisy round moves it by <= 25%.
+    # - TOLERANCE_Z is the coverage multiple z on the derived noise-floor
+    #   tolerances: a perfect model passes a z=2 threshold with ~95%
+    #   probability (two-sided Gaussian), so the schedule does not chase
+    #   noise.
+    LAMBDA_UPDATE_FACTOR = 1.25
+    TOLERANCE_Z = 2.0
+
     def __init__(
         self,
         epsilon,
@@ -167,12 +194,11 @@ class CLAIM(Mechanism):
         lambda_weight=0.5,
         mu_eta=1e-6,
         kappa_eta=1e-6,
-        adaptive_lambda=False,
+        adaptive_lambda=True,
         lambda_min=0.1,
         lambda_max=0.9,
-        lambda_update_factor=1.25,
-        ate_tolerance=0.01,
-        tvd_tolerance=0.05,
+        ate_tolerance=None,
+        tvd_tolerance=None,
         reference_ate=None,
         ate_sensitivity=None,
         reference_ate_rho_fraction=0.05,
@@ -216,17 +242,23 @@ class CLAIM(Mechanism):
         self.lambda_schedule = "adaptive" if self.adaptive_lambda else "fixed"
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
-        self.lambda_update_factor = float(lambda_update_factor)
-        self.ate_tolerance = ate_tolerance
-        self.tvd_tolerance = tvd_tolerance
+        # The multiplicative step c is a fixed constant of the schedule (like
+        # AIM's alpha and T), not a user input.
+        self.lambda_update_factor = self.LAMBDA_UPDATE_FACTOR
+        # Tolerances: None means "derive from the public noise floors each
+        # round" (see _derived_tolerances); a numeric value overrides.
+        self.ate_tolerance = None if ate_tolerance is None else float(ate_tolerance)
+        self.tvd_tolerance = None if tvd_tolerance is None else float(tvd_tolerance)
+        if self.ate_tolerance is not None and self.ate_tolerance <= 0:
+            raise ValueError("ate_tolerance must be positive (or None to derive it)")
+        if self.tvd_tolerance is not None and self.tvd_tolerance <= 0:
+            raise ValueError("tvd_tolerance must be positive (or None to derive it)")
         if not (0.0 <= self.lambda_weight <= 1.0):
             raise ValueError("lambda_weight must be in [0, 1]")
         if not (0.0 <= self.lambda_min <= self.lambda_max <= 1.0):
             raise ValueError("lambda_min/lambda_max must satisfy 0 <= min <= max <= 1")
         if self.adaptive_lambda and self.lambda_min <= 0:
             raise ValueError("adaptive lambda requires lambda_min > 0")
-        if self.lambda_update_factor <= 1.0:
-            raise ValueError("lambda_update_factor must be > 1")
 
         # ATE mode configuration
         self.treatment = treatment
@@ -236,6 +268,11 @@ class CLAIM(Mechanism):
         self.sim_sample_size = sim_sample_size
         self.causal_graph = None
         self.reference_ate = reference_ate
+        # Noise scale of the reference-ATE release; stays 0.0 when
+        # reference_ate is supplied externally (treated as exact), set by
+        # _release_private_reference_ate otherwise. Used by the derived
+        # ate_tolerance.
+        self.sigma_ate = 0.0
         self.ate_sensitivity = ate_sensitivity
         self.reference_ate_rho_fraction = float(reference_ate_rho_fraction)
         self.ate_outcome_range = (float(ate_outcome_range[0]), float(ate_outcome_range[1]))
@@ -509,7 +546,48 @@ class CLAIM(Mechanism):
             total += 0.5 * np.linalg.norm(y - xest, 1) / y.sum()
         return total / len(used_cliques)
 
-    def _adjust_lambda(self, current_lambda, tvd_error, ate_error):
+    def _derived_tolerances(self, measurements, cliques):
+        """Noise-floor-derived tolerances (theta_A, theta_L), fully public.
+
+        The principle: a tolerance below the error a *perfect* model would
+        exhibit is incoherent -- the schedule would chase pure noise. So each
+        tolerance is z times its perfect-model noise floor:
+
+        - theta_A = z * (sigma_ATE + sigma_MC). Even if the model's ATE were
+          exact, the measured error |ref - tau(model)| includes the Gaussian
+          noise of the reference release (std sigma_ATE, public) and the
+          Monte-Carlo error of estimating the model ATE from sim_sample_size
+          synthetic rows, conservatively bounded by
+          sigma_MC = (y_max - y_min) / sqrt(sim_sample_size).
+        - theta_L = z * mean_r sqrt(2/pi) * sigma_r * n_r / (2 * sum(y_r)),
+          the expected TVD between a perfect model and the *noisy* released
+          one-way marginals (E|N(0,s)| = s * sqrt(2/pi) per cell), using the
+          released noisy total as the public stand-in for N.
+
+        z = TOLERANCE_Z = 2 converts the mean noise level into a
+        pass-with-high-probability threshold (~95% for the Gaussian case).
+        Every ingredient is part of the DP transcript, so deriving the
+        tolerances is post-processing.
+        """
+        lo, hi = self.ate_outcome_range
+        sigma_mc = (hi - lo) / np.sqrt(self.sim_sample_size)
+        theta_a = self.TOLERANCE_Z * (self.sigma_ate + sigma_mc)
+
+        by_clique = {m.clique: m for m in measurements if m.clique in cliques}
+        floors = []
+        for cl in cliques:
+            if cl not in by_clique:
+                continue
+            m = by_clique[cl]
+            y = m.noisy_measurement
+            total = max(float(np.sum(y)), 1e-12)
+            floors.append(np.sqrt(2 / np.pi) * m.stddev * y.size / (2 * total))
+        if not floors:
+            raise ValueError("no noisy measurements available to derive tvd_tolerance")
+        theta_l = self.TOLERANCE_Z * float(np.mean(floors))
+        return theta_a, theta_l
+
+    def _adjust_lambda(self, current_lambda, tvd_error, ate_error, tvd_tolerance, ate_tolerance):
         """Combine last iteration's TVD and ATE errors into a new lambda_weight.
 
         Both errors are judged against their own tolerance. Lambda only moves
@@ -521,8 +599,8 @@ class CLAIM(Mechanism):
         within tolerance, lambda moves toward whichever objective is relatively
         further from its own tolerance.
         """
-        ate_ok = ate_error <= self.ate_tolerance
-        tvd_ok = tvd_error <= self.tvd_tolerance
+        ate_ok = ate_error <= ate_tolerance
+        tvd_ok = tvd_error <= tvd_tolerance
 
         if ate_ok and tvd_ok:
             return current_lambda
@@ -532,8 +610,8 @@ class CLAIM(Mechanism):
             return min(self.lambda_max, current_lambda * self.lambda_update_factor)
 
         # Neither preserved: favor whichever is relatively worse against its tolerance.
-        ate_ratio = ate_error / self.ate_tolerance
-        tvd_ratio = tvd_error / self.tvd_tolerance
+        ate_ratio = ate_error / ate_tolerance
+        tvd_ratio = tvd_error / tvd_tolerance
         if tvd_ratio >= ate_ratio:
             return min(self.lambda_max, current_lambda * self.lambda_update_factor)
         return max(self.lambda_min, current_lambda / self.lambda_update_factor)
@@ -545,30 +623,41 @@ class CLAIM(Mechanism):
         precise rule that keeps TVD preservation from being sacrificed without
         bound while still letting lambda decrease when there is fidelity slack.
 
-        Note: the ATE side of this still relies on `self.reference_ate`, which
-        defaults to a non-private (raw-data) computation unless a DP-released
-        reference_ate is passed in explicitly (see `run()`). The TVD side is
-        private post-processing, since it only reads already-released noisy
-        measurements.
+        Note: the ATE side reads `self.reference_ate`, which is either
+        supplied as an already-private value or auto-released privately by
+        `run()` from a slice of rho, and the model ATE, which is
+        post-processing of the DP model. The TVD side only reads
+        already-released noisy measurements. Hence the whole lambda update is
+        post-processing and consumes no additional privacy budget.
         """
         if not self.adaptive_lambda or self.selection_mode != "claim":
             return
-        if self.ate_tolerance is None:
-            raise ValueError("adaptive lambda requires ate_tolerance")
-        if self.tvd_tolerance is None:
-            raise ValueError("adaptive lambda requires tvd_tolerance")
+
+        # Resolve tolerances: user-supplied values win; otherwise derive them
+        # from the public noise floors (see _derived_tolerances).
+        ate_tolerance = self.ate_tolerance
+        tvd_tolerance = self.tvd_tolerance
+        if ate_tolerance is None or tvd_tolerance is None:
+            derived_a, derived_l = self._derived_tolerances(measurements, cliques)
+            if ate_tolerance is None:
+                ate_tolerance = derived_a
+            if tvd_tolerance is None:
+                tvd_tolerance = derived_l
 
         current_ate_error, current_ate = self._ate_error_for_model(model, seed=42)
         current_tvd_error = self._tvd_error_for_model(model, measurements, cliques)
         old_lambda = self.lambda_weight
         self.lambda_weight = self._adjust_lambda(
-            old_lambda, current_tvd_error, current_ate_error
+            old_lambda, current_tvd_error, current_ate_error,
+            tvd_tolerance, ate_tolerance,
         )
         print(
             "Adaptive lambda: "
-            f"ATE error={current_ate_error:.6f} (tol={self.ate_tolerance:.4f}), "
+            f"ATE error={current_ate_error:.6f} (tol={ate_tolerance:.4g}"
+            f"{'' if self.ate_tolerance is not None else ', derived'}), "
             f"model ATE={current_ate:.6f}, "
-            f"TVD error={current_tvd_error:.6f} (tol={self.tvd_tolerance:.4f}), "
+            f"TVD error={current_tvd_error:.6f} (tol={tvd_tolerance:.4g}"
+            f"{'' if self.tvd_tolerance is not None else ', derived'}), "
             f"lambda {old_lambda:.4f} -> {self.lambda_weight:.4f}"
         )
 
@@ -761,6 +850,7 @@ class CLAIM(Mechanism):
         ate_rho = self.reference_ate_rho_fraction * self.rho
         raw_ate = self.compute_ate_from_data(data.df)
         sigma_ate = sensitivity / np.sqrt(2 * ate_rho)
+        self.sigma_ate = float(sigma_ate)  # public; used by derived ate_tolerance
         private_ate = float(raw_ate + self.gaussian_noise(sigma_ate, 1)[0])
         self.rho -= ate_rho
         print(
@@ -996,12 +1086,13 @@ def default_params():
     params["lambda_weight"] = 0.5
     params["mu_eta"] = 1e-6
     params["kappa_eta"] = 1e-6
-    params["adaptive_lambda"] = False
+    params["adaptive_lambda"] = True  # lambda is adaptive by default
     params["lambda_min"] = 0.1
     params["lambda_max"] = 0.9
-    params["lambda_update_factor"] = 1.25
-    params["ate_tolerance"] = 0.01
-    params["tvd_tolerance"] = 0.05
+    # Tolerances default to None: derived per round from the public noise
+    # floors (see CLAIM._derived_tolerances). Numeric values override.
+    params["ate_tolerance"] = None
+    params["tvd_tolerance"] = None
     params["reference_ate"] = None
     params["ate_sensitivity"] = None
     params["reference_ate_rho_fraction"] = 0.05
@@ -1074,29 +1165,29 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--adaptive_lambda",
-        action="store_true",
-        help="Adapt lambda during one CLAIM run using the current model's ATE and TVD error"
+        action=argparse.BooleanOptionalAction,
+        help="Adapt lambda during the run using the current model's ATE and "
+        "TVD errors. On by default; pass --no-adaptive_lambda to keep "
+        "lambda_weight fixed for the whole run"
     )
     parser.add_argument("--lambda_min", type=float, help="Minimum adaptive lambda")
     parser.add_argument("--lambda_max", type=float, help="Maximum adaptive lambda")
-    parser.add_argument(
-        "--lambda_update_factor",
-        type=float,
-        help="Multiplicative adaptive lambda update factor"
-    )
     parser.add_argument(
         "--ate-tolerance",
         "--ate_tolerance",
         dest="ate_tolerance",
         type=float,
-        help="ATE-error tolerance for adaptive lambda"
+        help="ATE-error tolerance for adaptive lambda. Omit to derive it from "
+        "the public noise floors: z*(sigma_ATE + (y_max-y_min)/sqrt(sim_sample_size))"
     )
     parser.add_argument(
         "--tvd-tolerance",
         "--tvd_tolerance",
         dest="tvd_tolerance",
         type=float,
-        help="TVD-error tolerance for adaptive lambda"
+        help="TVD-error tolerance for adaptive lambda. Omit to derive it as z "
+        "times the expected TVD of a perfect model against the noisy released "
+        "one-way marginals"
     )
     parser.add_argument(
         "--reference_ate",
@@ -1187,8 +1278,9 @@ if __name__ == "__main__":
 
     workload = [(cl, 1.0) for cl in workload]
 
-    if args.fixed_lambda_from_list and args.adaptive_lambda:
-        raise ValueError("Use either --fixed_lambda_from_list or --adaptive_lambda, not both")
+    # Lambda is adaptive by default (--no-adaptive_lambda disables it);
+    # pilot-based selection (--fixed_lambda_from_list) implies a fixed lambda.
+    adaptive_lambda = args.adaptive_lambda and not args.fixed_lambda_from_list
 
     claim_kwargs = dict(
         max_model_size=args.max_model_size,
@@ -1201,10 +1293,9 @@ if __name__ == "__main__":
         lambda_weight=args.lambda_weight,
         mu_eta=args.mu_eta,
         kappa_eta=args.kappa_eta,
-        adaptive_lambda=args.adaptive_lambda,
+        adaptive_lambda=adaptive_lambda,
         lambda_min=args.lambda_min,
         lambda_max=args.lambda_max,
-        lambda_update_factor=args.lambda_update_factor,
         ate_tolerance=args.ate_tolerance,
         tvd_tolerance=args.tvd_tolerance,
         reference_ate=args.reference_ate,
