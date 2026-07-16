@@ -129,10 +129,16 @@ class CLAIM(Mechanism):
             on the Monte-Carlo error of the model-ATE estimate, and
             z = TOLERANCE_Z. Rationale: below this floor even a perfect model
             fails the test routinely, so the schedule would chase noise.
-        tvd_tolerance: Tolerance theta_L on the model's average one-way TVD
-            error for the adaptive lambda schedule. Default None: derived
-            each round as z times the expected TVD a *perfect* model would
-            show against the noisy released marginals,
+        tvd_tolerance: Tolerance theta_L on the model's average TVD error
+            over ALL cliques with released measurements (the one-way
+            marginals from initialization plus every clique selected so far;
+            for a repeatedly measured clique, its most recent release is
+            used). Monitoring only one-ways would report permanent "fidelity
+            slack" -- they are measured directly at initialization and fit
+            almost immediately -- pinning lambda at the causal end while
+            pairwise fidelity degrades unobserved. Default None: derived each
+            round as z times the expected TVD a *perfect* model would show
+            against the noisy released marginals,
             z * mean_r [ sqrt(2/pi) * sigma_r * n_r / (2 * sum(y_r)) ],
             all of which is computable from the DP transcript.
         adaptive_lambda: If True (the default), lambda_weight is adjusted at the end of each round
@@ -950,7 +956,14 @@ class CLAIM(Mechanism):
             # model update, so lambda_{t+1} reacts to the newest DP transcript.
             # Decreasing lambda gives more weight to the causal term; increasing
             # lambda gives more weight to the statistical/marginal term.
-            self._maybe_update_lambda(model, measurements, oneway)
+            # Monitor fidelity over ALL cliques with released measurements
+            # (one-ways from init plus every clique selected so far), not just
+            # the one-way marginals: one-ways are measured directly at
+            # initialization and fit almost immediately, so monitoring them
+            # alone reports permanent "fidelity slack" and pins lambda at the
+            # causal end while pairwise fidelity degrades unobserved.
+            measured_cliques = list(dict.fromkeys(M.clique for M in measurements))
+            self._maybe_update_lambda(model, measurements, measured_cliques)
 
             w = model.project(cl).datavector()
             # print('Selected',cl,'Size',n,'Budget Used',rho_used/self.rho)
